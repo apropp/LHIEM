@@ -1,0 +1,1167 @@
+---
+title: "Predicting The Dynamics of Health Status"
+bibliography: ../../WriteUp/bibliography.bib
+output:
+  html_notebook: default
+  html_document:
+    df_print: paged
+  word_document: default
+pandoc_args: --natbib
+biblio-style: plain
+---
+
+# Introduction
+
+In this notebook our aim is to develop a simple model of health status dynamics by gender and age that can be integrated as part of the simulation model of the dynamics. Our approach will be to construct a relatively simple model with just two health status states: good and bad health. A more sophisticated model would consider specific acute and chronic health conditions and their gender and age related hazard rates. Such data can be collected from specific papers or from the team working on the Future Americans Model (FAM).
+<!-- 1. Diabetes^[see the plot in https://jamanetwork.com/journals/jama/fullarticle/197439 and Figure 1 https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2748236/ also see https://www.livestories.com/statistics/us-diabetes-deaths-mortality which uses data available at https://wonder.cdc.gov/].  -->
+<!-- 2. Cardivasular Diseases -->
+<!-- 3. Cancers^[see https://onlinelibrary.wiley.com/doi/full/10.3322/caac.21551 Table 3 and Figure 4]  -->
+<!-- 4. General Disability and Morbidity life tables^[See the plot on page 29 of the WHO Scientific Group on the Epidemiology of Aging & World Health Organization. (1984). The uses of epidemiology in the study of the elderly : report of a WHO Scientific Group on the Epidemiology of Aging [meeting held in Geneva from 11 to 17 January 1983]. World Health Organization. https://apps.who.int/iris/handle/10665/39136. This is also presented on page 17 https://books.google.com/books?id=jTTUBwAAQBAJ&printsec=frontcover&hl=it&source=gbs_ge_summary_r&cad=0#v=onepage&q&f=false]. -->
+
+<!-- @Narayan2003 -->
+
+<!-- @Pencina:2009aa -->
+
+<!-- ```{r fig.height=4, fig.width=8,echo=FALSE} -->
+<!-- ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t1.png")) -->
+<!-- ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t2.png")) -->
+<!-- plot_grid(ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t3.png")), -->
+<!--           ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t4.png")), -->
+<!--           ncol=2,scale=1) -->
+<!-- ``` -->
+
+Our approach here follows from previous two older versions of this notebook. The approached used there was based on the following 
+
+1.	First get the hazard rate for developing any chronic condition as a function of age and gender. To quantify this we will first focus on 3 specific progressive chronic degenerative disease (PCDD): Diabetes, Heart Disease, and all Cancers. We will separately estimate the age and gender specific hazard rate of developing each disease. 
+2. Using CDC statistics that provide the proportion of the 10 leading causes of deaths by age groups, we will project how each of the hazard rates for 3 diseases translate into hazard rates for all PCDDs.  
+3. Using the same CDC statistics we will find the proportion of deaths due to PCDDs and the proportion of deaths due to acute events (e.g., injuries, accidents, suicides and homicides). We use these proportions together with the PCDD hazard rates to estimate the acute event hazard rate. Note that this estimated hazard rate describes the risk of an acute event and not the risk of death from an acute event. Hence, fundamentally here we **assume** that the CDC proportions describing the different causes of deaths can be equally interpreted as the proportions of the events for developing the conditions that eventually lead up to those death events.^[This is a strong assumption because especially at younger ages there may be many more injuries that don't eventually lead up to a death compared to chronic disease conditions that do.]      
+
+
+What we found is that when we used this approach our proportions of people in good health was very low at older ages and much lower than that given by the self-reported proportions given in the MEPS data. Therefore here before going with specific chronic disease we start with the MEPS data
+
+
+```{r include=FALSE}
+remove(list = ls())
+library(here)
+library(openxlsx)
+library(measurements)
+library(spatstat)
+library(MortalityLaws)
+library(imputeTS)
+library(ggplot2)
+library(scales) 
+library(reshape2)
+library(cdlTools)
+library(tidyverse)
+library(cowplot)
+path <- getwd()
+#setwd("/Users/rvardava/OneDrive - Rand Corporation/Temp_RAPP")
+
+big <- 20
+small <- 16
+
+clean.num.entries<-function(dat,col=NULL){
+  if(is.null(col))(col<- colnames(dat)[-1])
+  for(i in col){
+    dat[,i] <- gsub(",","",dat[,i])
+    dat[,i] <- gsub("<","",dat[,i])
+    dat[,i] <- gsub("\\(.*","",dat[,i])
+    dat[,i] <- as.numeric(dat[,i])
+  }
+  return(dat)
+}
+
+get.LT.from.GM.model<- function(lt, ages=c(0:105)){
+  
+  M1<-MortalityLaw(lt$x,  mx=lt$mx,law="makeham")
+  coeff<-M1$coefficients
+  #mx<- coeff["A"]*exp(coeff["B"]*ages)+coeff["C"]
+  mx<- predict(M1, x = ages)
+  
+  lt.model <- (LifeTable(ages,  mx=mx))$lt
+  return(lt.model)
+}
+```
+
+# MEPS analysis of health status
+
+
+We can load the MEPS data and use the self report of health status by gender and by age to see how the hazard rates look like. Here we interpret health status values 1 to 3 to be good health status and 4 and 5 to be bad health status. My analyzing the data, inserting missing values by interpolation and using smoothing we get the following plots. 
+
+```{r echo=FALSE}
+load(file.path(("../../Data/"),'h193.Rdata'))
+dat <- subset(h193, ALL5RDS==1 | (DIED==1 & YEARIND==1))
+dat <- subset(dat, dat$AGEY1X>0) # Select only those with a positive age
+dat$HealthStat[dat$RTHLTH3<=3] <- 1; dat$HealthStat[dat$RTHLTH3>3] <- 2; dat$HealthStat[dat$RTHLTH3<1] <- 0
+dat$HS <- factor(dat$HealthStat, labels=c("N/A","good","bad"))
+# Sex - just convert to factor
+dat$Sex <- factor(dat$SEX, labels=c("male","female"))
+
+dat <- dat %>% 
+  select(Sex,AGEY1X,HS,LONGWT) %>% 
+  rename(sex=Sex, age=AGEY1X, health.status=HS, w=LONGWT)
+
+tab<- dat %>% 
+  group_by(sex,age,health.status) %>% 
+  summarise(N = sum(w)) %>% 
+  spread(key= health.status, value="N") %>% 
+  mutate(N=good+bad, good=good/N, bad=bad/N)
+
+meps.lx <- tab %>% 
+  select(age,sex,good) %>% 
+  rename(x=age, lx=good) %>% 
+  split(.$sex)
+
+meps.lx <- left_join(meps.lx$male,meps.lx$female,by="x",suffix=c(".m",".f"))
+meps.lx$lx.m <-na_interpolation(meps.lx$lx.m, option = "linear")  
+meps.lx$lx.f <-na_interpolation(meps.lx$lx.f, option = "linear") 
+
+lt.m<-(LifeTable(meps.lx$x,  lx=meps.lx$lx.m))$lt 
+lt.m$mx[lt.m$mx<0] <- min(lt.m$mx[lt.m$mx>0])
+smoothing.model <- loess(mx~x,data=lt.m,span=0.3)
+lt.m$mx <- predict(smoothing.model)
+lt.m<-(LifeTable(meps.lx$x,  mx=lt.m$mx))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+
+lt.f<-(LifeTable(meps.lx$x,  lx=meps.lx$lx.f))$lt 
+lt.f$mx[lt.f$mx<0] <- min(lt.f$mx[lt.f$mx>0])
+smoothing.model <- loess(mx~x,data=lt.f,span=0.3)
+lt.f$mx <- predict(smoothing.model)
+lt.f<-(LifeTable(meps.lx$x,  mx=lt.f$mx))$lt %>%  
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.meps <- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+```
+The plot below in the left panel shows the curve for $l_x^{[MEPS]}$. This represents our target, we want our constructed curves not to be too dissimilar to the one shown here. 
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.meps%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion good health (%)"
+      ) +
+  ggtitle("MEPS data")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.meps%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("MEPS data")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.lx, p.mx,  nrow=1, labels=c('lx', 'mx'))
+```
+
+# The Chronic Health Conditions
+
+We want to split the Hazard rate between Chronic and Acute conditions. For the Chronic conditions we will focus on Cardiovascular/Heart Disease (CVD) and Cancers. In our previous version of this notebook we also considered Diabetes but Diabetes has a strong co-morbidity with CVD. Therefore we use CVD and Cancers to represent the whole set of PCDD.  
+
+
+## Heart Disease/ Cardiovascular disease (CVD)
+
+Figure 1A in @Crimmins:2008aa which is shown below provides the $m_x^{[CVD]}$ for males and females for ages 50+. We can extract the data from this plot using the online-tool automeris^[ https://apps.automeris.io/wpd/]. 
+```{r fig.height=4, fig.width=8,echo=FALSE}
+#ggdraw() + draw_image(file.path("../Health Status/Figures/heart_disease.png"))
+```
+We then using a smoothing function to extrapolate these rates to younger ages. Note, the smoothing process is not perfect and required some help. This was done by assuming that $m_0^{[CVD]}=0$ for both ages and that $m_{20}^{[CVD]}=10^{-4}$ for females and $5\times 10^{-4}$ for males. The plots below provide the $ l_{x}^{[CVD]}$ and $m_{x}^{[CVD]}$ curves for both males and females based on the data and the smoothing. 
+
+```{r echo=FALSE}
+DiseaseFreeData.file <- "Data/DiseaseFreeData.xlsx"
+cvd.m<- read.xlsx(file.path(path,DiseaseFreeData.file),sheet="CVD_males") %>%  rename(x=age)
+cvd.f<- read.xlsx(file.path(path,DiseaseFreeData.file),sheet="CVD_females") %>%  rename(x=age)
+
+cvd.m <- rbind(c(0,0),c(20,5e-4),cvd.m)
+smoothing.model <- loess(mx~x,data= cvd.m,span=0.2)
+
+x<- c(0:round(max(cvd.m$x)))
+cvd.m <-cbind.data.frame(x=x,mx=pmax(predict(smoothing.model,newdata = x),1e-6))
+ 
+lt.cvd.m<-(LifeTable(cvd.m$x,  mx=cvd.m$mx))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+
+cvd.f <- rbind(c(0,0),c(20,1e-4),cvd.f)
+smoothing.model <- loess(mx~x,data= cvd.f,span=0.2)
+
+x<- c(0:round(max(cvd.f$x)))
+cvd.f <-cbind.data.frame(x=x,mx=pmax(predict(smoothing.model,newdata = x),1e-6))
+ 
+lt.cvd.f<-(LifeTable(cvd.f$x,  mx=cvd.f$mx))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+
+lt.cvd <- left_join(lt.cvd.m,lt.cvd.f,by="x",suffix=c(".m",".f"))
+```
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.cvd%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("CVD")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.cvd%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("CVD")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.lx, p.mx,  nrow=1, labels=c('lx', 'mx'))
+```
+
+## Cancers
+
+FigureS2 in @American_Cancer_Society2019 which is shown below provides the $m_x^{[Cancer]}$ for males and females for ages 50+. As before, we can extract the data from this plot using the online-tool automeris. 
+```{r fig.height=4, fig.width=8,echo=FALSE}
+ggdraw() + draw_image(("Figures/cancers.png"))
+```
+Since this data-set provides the incidence, and hence the rates for all cancers for both genders and for all ages, even for the very young, there was limited need for smoothing an extrapolation. The plots below provide the $l_{x}^{[Cancer]}$ and $m_{x}^{[Cancer]}$ curves for both males and females based on the data. 
+
+
+```{r echo=FALSE}
+cancer.m<- read.xlsx((DiseaseFreeData.file),sheet="Cancer_males") %>%  rename(x=age)
+cancer.f<- read.xlsx((DiseaseFreeData.file),sheet="Cancer_females") %>%  rename(x=age)
+
+cancer.m$mx  <- cancer.m$incidence_per_100000/1e5
+smoothing.model <- loess(mx~x,data= cancer.m,span=0.15)
+
+x<- c(0:round(max(cancer.m$x)))
+cancer.m <-cbind.data.frame(x=x,mx=predict(smoothing.model,newdata = x))
+ 
+lt.cancer.m<-(LifeTable(cancer.m$x,  mx=cancer.m$mx))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+
+cancer.f$mx  <- cancer.f$incidence_per_100000/1e5
+smoothing.model <- loess(mx~x,data= cancer.f,span=0.15)
+
+x<- c(0:round(max(cancer.f$x)))
+cancer.f <-cbind.data.frame(x=x,mx=predict(smoothing.model,newdata = x))
+ 
+lt.cancer.f<-(LifeTable(cancer.f$x,  mx=cancer.f$mx))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+
+lt.cancer <- left_join(lt.cancer.m,lt.cancer.f,by="x",suffix=c(".m",".f"))
+```
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.cancer%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("All-Cancers")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.cancer%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("All-Cancers")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.lx, p.mx,  nrow=1, labels=c('lx', 'mx'))
+```
+
+
+# Overall morbidity rate of progressive chronic degenerative disease (PCDD) 
+
+Here we assume that CVD and Cancers are representative of the whole set of PCDD and use their rates to obtain the overall morbidity rate by gender and by age. To combine these rates we will use data from recent CDC tables that give the proportion of leading causes of death for 2017 by age and gender^[https://www.cdc.gov/nchs/data/nvsr/nvsr68/nvsr68_06-508.pdf]. We then assume that the chronic morality hazard rate is equal to the all-cause morality hazard rate multiplied by the chronic proportion. Figure 2 in the CDC report provides pie charts giving the percent distribution of the 10 leading causes of death, by age group: United States, 2017. These pie charts are shown below.
+```{r fig.height=8, fig.width=7,echo=FALSE}
+#ggdraw() + draw_image(("../Health Status/Figures/CDC2017.png"),height=1,scale=1)
+```
+The ten leading causes are Heart disease, Cancer, Chronic lower respiratory diseases, Stroke (cerebrovascular diseases),  Alzheimer’s disease,  Diabetes,  Nephritis (including nephrotic syndrome and nephrosis),  Influenza and Pneumonia,  Accidents and Intentional self-harm (suicide). We assume that the latter three are acute cases while the first seven are chronic cases. The pie charts include an additional cause that aggregate all the other causes. It is unclear if these other causes are mainly chronic or acute. 
+
+```{r echo=FALSE, warning=FALSE}
+CDC.data <- "Data/CDC_10_leading_causes_of_death_2017.xlsx"
+cdc.summary<- read.xlsx(file.path(path,CDC.data),sheet=1)
+print(cdc.summary %>% select(-age.mid))
+```
+```{r echo=FALSE, warning=FALSE}
+CDC.data <- "Data/CDC_10_leading_causes_of_death_2017.xlsx"
+cdc<- read.xlsx(file.path(path,CDC.data),sheet=2)
+cdc[,!colnames(cdc)%in%"x"] <- NA
+cdc[cdc.summary$age.mid+1, ] <- cdc.summary[,!colnames(cdc.summary)%in%c("ageg")]
+cdc[,-1]<-na_interpolation(cdc[,-1], option = "linear")  
+
+  dat.new <- cdc
+  for(i in colnames(cdc)[-1]){
+    smoothing.model <- loess(dat.new[,i]~x,data= cdc,span=0.15)
+    dat.new[,i] <-pmax(0,predict(smoothing.model,newdata = cdc$x))
+  }
+ dat.new$Chronic_all_other <- 1- (rowSums(dat.new[,-1])-dat.new$Chronic_all_other )
+
+cdc <- dat.new
+```
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- cdc%>% 
+  mutate(Chronic_all_other=Chronic_all_other+Diabetes) %>% 
+  select(-Diabetes) %>% 
+ gather(type,disease,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+
+p.prop <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = disease,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion Disease"
+      ) +
+  ggtitle("Morbidity Proportions by Age")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   #scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p.prop)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","CDC_acute_chronic_table.png"),width = 10,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","CDC_acute_chronic_table.svg"),width = 10,heigh=5)
+```
+
+```{r echo=FALSE}
+cdc.chronic <- cdc %>% 
+  mutate(N= CVD+Cancer, CVD= CVD/N, Cancer= Cancer/N ) %>% 
+  select(x,CVD,Cancer) 
+
+cdc.reduced <- cdc %>% 
+  mutate(N= Acute+CVD+Cancer, a = Acute/N , c= (CVD+Cancer)/N ) %>% 
+  select(x,a,c) %>% 
+  rename(Acute=a, Chronic=c)
+```
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- cdc.chronic%>% 
+ gather(type,disease,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+
+p.prop1 <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = disease,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion Chronic Disease"
+      ) +
+  ggtitle("Morbidity Proportions by Age")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("gold","lightblue"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+dat.p<- cdc.reduced%>% 
+ gather(type,disease,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+
+p.prop2 <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = disease,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion Disease"
+      ) +
+  ggtitle("Morbidity Proportions by Age")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkgreen","purple"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.prop1, p.prop2,  nrow=1, labels=c('chronic', 'all'))
+```
+
+We will assume that $$m_x^{[Chronic]} = m_x^{[CVD]}+m_x^{[Cancer]}$$. This is because, as explained previously CVD and Cancer have little co-morbidity rates and can be assumed to be uncorrelated. They represent a large part of chronic conditions, and these other chronic conditions have co-morbidities with either of the two. 
+
+
+```{r echo=FALSE}
+
+sub.set <- c(1:98)
+x<- sub.set-1
+
+
+mx.chronic <-(lt.cvd[sub.set,c("mx.m","mx.f")]+lt.cancer[sub.set,c("mx.m","mx.f")])
+
+
+
+lt.m<-(LifeTable(x,  mx=mx.chronic$mx.m))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.f<-(LifeTable(x,  mx=mx.chronic$mx.f))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.chronic <- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+```
+
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.chronic%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx.chronic <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("All-Chronic")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.chronic%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx.chronic <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("All-Chronic")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+
+
+plot_grid(p.lx.chronic, p.mx.chronic,  nrow=1, labels=c('lx', 'mx'))
+```
+
+# The Acute Health Events
+
+Our aim is to try to encompass or be as close as possible to the MEPS curves as possible. This means we can adjust the acute rate to try to get as close as possible to the MEPS. But before doing this let's see how close we can get if we use the CDC data. We will assume that $$m_x^{[Acute]} = m_x^{[Chronic]} \cdot \frac{P_x^{[Acute]}}{P_x^{[Chronic]}}$$ and $$m_x^{[Morb]} = m_x^{[Acute]}+m_x^{[Chronic]}= m_x^{[Chronic]}\cdot \frac{P_x^{[Acute]}+P_x^{[Chronic]}}{P_x^{[Chronic]}}$$. However, before proceeding with this we note that the pie charts in the CDC data provide the proportions by age group only and not by age group and gender which would have been desirable. However, we have a gender only pie charts. 
+```{r fig.height=3, fig.width=7,echo=FALSE}
+ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/CDC2017_gender.png"),height=1,scale=1)
+```
+The chronic conditions we focused on namely,  CVD and Cancers do not differ too much across gender. However, acute cases do differ by gender. Indeed, males overall have roughly 50% more acute cases than females ((2.6+1.8+7.6)/(1.6+2.1+4.4)). We shall use this correction factor to adjust for this difference and use it compute the net hazard rate from good to bad health by gender for acute events.
+```{r echo=FALSE}
+cdc.reduced.m <- cdc.reduced %>% 
+  mutate(Acute=Acute*1.5,N= Acute+Chronic, Acute=Acute/N,Chronic=Chronic/N) %>% 
+  select(x,Acute, Chronic)
+
+mx.all <- mx.chronic
+mx.all$mx.f <- mx.chronic$mx.f*((cdc.reduced$Acute+cdc.reduced$Chronic)/cdc.reduced$Chronic)[1:nrow(mx.chronic)]
+mx.all$mx.m <- mx.chronic$mx.m*((cdc.reduced.m$Acute+cdc.reduced.m$Chronic)/cdc.reduced.m$Chronic)[1:nrow(mx.chronic)]
+lt.m<-(LifeTable(x,  mx=mx.all$mx.m))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.f<-(LifeTable(x,  mx=mx.all$mx.f))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.all<- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+```
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.all%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx<- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("All-Health")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.all%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("All-Health")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.lx, p.mx,  nrow=1, labels=c('lx', 'mx'))
+```
+
+Comparing the $l_x^{[All-Health]}$ to the $l_x^{[MEPS]}$ we see that for older ages there is relatively good agreement. This is not so for younger ages. We are getting higher $l_x^{[All-Health]}$ and thus we need to increase the mortality rate at younger ages.
+
+```{r echo=FALSE}
+lt.diff <- lt.meps
+lt.diff[,-1]<-lt.all[1:nrow(lt.meps),-1]-lt.meps[,-1]
+
+dat.p<- lt.diff%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx<- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "lx: Model-MEPS"
+      ) +
+  ggtitle("Error in lx")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p.lx)
+```
+
+## Correction to the Acute rate
+
+To get it $l_x^{[All-Health]}$ closet to the $l_x^{[MEPS]}$ we can try to increase the acute rate for younger ages. The easiest and most sensible correction is an exponentially decaying with age correction to the $m_x^{[All-Health]}$. We therefore assume an exponentially decaying with age additional mortality rate that describes unaccounted acute cases in order to match our model  $l_x^{[All-Health]}$ to the $l_x^{[MEPS]}$. Our fit starts with an additional $\delta m_0=10^{-2}$ and a half-life of $t_{1/2}=35$ years. Hence $\delta m_x= \delta m_0 e^{-\log(2) x/t_{1/2}}$. The values for $\delta m_0$ and $t_{1/2}$ were found manually with the aim of minimizing the two differences namely, $l_{x}^{[All-Health]}-l_{x}^{[MEPS]}$ evaluated at ages $x=25$ and $x=75$. 
+
+```{r echo=FALSE}
+mx.all <- mx.chronic
+mx.all$mx.f <- mx.chronic$mx.f*((cdc.reduced$Acute+cdc.reduced$Chronic)/cdc.reduced$Chronic)[1:nrow(mx.chronic)]
+mx.all$mx.m <- mx.chronic$mx.m*((cdc.reduced.m$Acute+cdc.reduced.m$Chronic)/cdc.reduced.m$Chronic)[1:nrow(mx.chronic)]
+
+
+mx.all.no.correction <- mx.all
+
+a<- 1e-2
+t.half<- 30 
+mx.all <-mx.all %>% 
+  mutate(mx.m =mx.m+ a*exp(-log(2)*x/t.half), mx.f =mx.f+ a*exp(-log(2)*x/t.half))
+
+mx.acute<-mx.all-mx.chronic
+
+
+lt.m<-(LifeTable(x,  mx=mx.all$mx.m))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.f<-(LifeTable(x,  mx=mx.all$mx.f))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.all<- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+
+lt.m<-(LifeTable(x,  mx=mx.acute$mx.m))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.f<-(LifeTable(x,  mx=mx.acute$mx.f))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.acute<- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+```
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.all%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx<- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("All-Health")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.all%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("All-Health")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.lx, p.mx,  nrow=1, labels=c('lx', 'mx'))
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","all_health_morbidity_table.png"),width = 15,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","all_health_morbidity_table.svg"),width = 15,heigh=5)
+```
+
+
+# Reversibility in the Acute Health Events
+
+Having modeled the irreversible transitions from good to bad health due to the onset of a chronic condition - we now move to model the reversible transition rates between good and bad health due to an acute event. The diagram below shows the difference in conceptualization between the chronic and the acute conditions for any given age.  
+
+```{r fig.height=4, fig.width=7,echo=FALSE}
+ggdraw() + draw_image(file.path(path,"Figures/SimpleTransitionModel/Slide1.png"),height=1,scale=1)
+```
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- lt.acute%>% 
+  select( x,lx.m, lx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+
+p.lx.acute <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion disease free (%)"
+      ) +
+  ggtitle("All-Acute")+
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1))+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+
+dat.p<- lt.acute%>% 
+  select( x,mx.m, mx.f) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("females","males")
+
+p.mx.acute <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Hazard rate"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("All-Acute")+
+   scale_colour_manual(values = c("darkred","navy"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+
+plot_grid(p.lx.acute,p.mx.acute,  nrow=1, labels=c('lx', 'mx'))
+```
+
+However, as illustrated by our figure above this only computes the net transition from good to bad health status. Instead we want a model that considers reversibility of health status. From Life-Table theory, if $q_x^{[mort]}$ represents the probability that a person of age $x$ will die within one year and $l_x^{[mort]}$ the number of persons surviving to age $x$, then $l_x^{[mort]} = l_{x-1}^{[mort]}(1-q^{[mort]}_{x-1})$. Since, $q^{[mort]}_x\sim m^{[mort]}_x$ for most ages - this is approximately $l_x^{[mort]} \approx l_{x-1}^{[mort]}(1-m^{[mort]}_{x-1})$.
+
+
+We can use similar logic and instead define $b_x$ to represent the probability that a person in good health of age $x$ will experience an acute health event taking him/her from good to bad health, $g_x$ a person in bad health of age $x$ will experience an acute health event taking him/her from  bad to good health. We then focus on the subset of acute events. Thus here no chronic health conditions events occur, and define $l_x$ to be the proportion of people in good health. 
+
+
+Hence, the proportion of people of age $x$ in bad health is $1-l_x$. Hence we can write $$l_x m_x= l_x b_x -(1-l_x)g_x$$, where here $m_x$ represents our net probability of the irreversible process going from good to bad health which we have just quantified. Since we know, $l_x$ and $m_x$ we need a reasonable model for the rate $g_x$ as a function of age $x$. The rate $g_x$ describes how fast a person who experienced an acute heath event recovers back to good health. A reasonable assumption is that this recovery rate is an exponentially decreasing function with age such that it is close to being a zero rate once a person reaches old age (e.g., 70+). A reasonable estimate for recovery duration in younger ages is of the order of a year. Thus, $g_x\sim a e^{-\log(2) x/t_{1/2}}$, with $g_0^{-1} \sim 1$ year and $g_{50}^{-1} \sim 30$ years.  Thus we can set $a=1$ and the half-life $t_{1/2}= 50 \log(2)/\log(32)=10$ years. Note that the parameters $a$ and $t_{1/2}$ could be varies and used as calibration parameters. By specifying the function for $g_x$ we can find $b_x$ as $$b_x=m_x +(1/l_x-1)g_x$$. When we apply this function to our data we get the rates shown in the plot below. Note that at age 0, the rate from good to bad (i.e., $b_x$) is the same as the net rate ($m_x$), this is because there is no one yet who has experiences an acute event and needs to recover from it. Then with age, the rate $b_x$ becomes bigger in order to balance out the recovery transitions from bad to good $g_x$ and recover our net rate $m_x$. However, for much older ages the rate $g_x$ becomes negligible and thus $b_x$ approaches $m_x$ asymptotically.   
+```{r echo=FALSE}
+a<- 1
+t.half<- 10#14.26
+
+# Note the equations below seem to be a slight devation from what is written in the text. 
+# First we divide the lx's by 100 to get a proportion. More importantly lx-lx*slx represents the number people in bad health which has to be a +ve number. 
+
+morbid.model.acute<- lt.acute 
+morbid.model.acute <- morbid.model.acute %>%
+  mutate(gx = a*exp(-log(2)*x/t.half),
+         bx.m = mx.m+(1/lx.m-1)*gx,
+         bx.f = mx.f+(1/lx.f-1)*gx )
+```
+
+```{r echo=FALSE,fig.height=4, fig.width=12}
+dat.p<- morbid.model.acute %>% 
+  select( x,mx.m, bx.m,gx) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("good->bad","bad->good","net")
+
+p.m <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Transition Prob."
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("Acute Transition Prob for Males")+
+   scale_colour_manual(values = c("deeppink2","steelblue2","navyblue"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+dat.p<- morbid.model.acute %>% 
+  select( x,mx.f, bx.f,gx) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("good->bad","bad->good","net")
+
+p.f <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Transition Prob."
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("Acute Transition Prob for Females")+
+   scale_colour_manual(values = c("deeppink2","steelblue2","darkred"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+plot_grid(p.m,p.f,  nrow=1, labels=c('M', 'F'))
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","acute_morbidity_table.png"),width = 15,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures","acute_morbidity_table.svg"),width = 15,heigh=5)
+```
+
+# Transition Probabilities that enter the simulation
+
+Finally, we compile the transition probabilities that can be used as inputs to the simulation model. The column names have been renames and made them more descriptive.
+
+```{r echo=FALSE}
+morbid.model.chronic<- lt.chronic 
+transition.rates<-left_join(morbid.model.chronic %>% select(x,mx.m,mx.f),morbid.model.acute %>% select(x, bx.m,bx.f,gx),by="x") %>% 
+  rename(chronic.male=mx.m,chronic.fremale=mx.f,acute.male=bx.m,acute.female=bx.f,acute.recov=gx)
+
+print(head(transition.rates))
+print(tail(transition.rates))
+```
+
+# Ways to use this table in the Simulation model
+
+The simulation model uses the 2018 mortality rates that depend on age and gender. Depending on Health Spending of each individual in a given year we modify his  mortality rate. The way we do this was described in a previous R Notebook titled "Predicting Mortality from Health Spending". In the simulation model before we apply mortality rates we need to update the health status of each individual. 
+
+1. We should start with the acute events. For each health individual we use the acute probability to find whether s/he transitions to the unhealthy state. In this case we mark that the transition was due to an acute event. Here we will need a column that tracks whether the individual is in an unhealthy state due to an acute or chronic condition. For those who are in the unhealthy state due to an acute event we  find whether s/he transitions back to the healthy state. 
+2. We then use the chronic condition rates and apply them to all those individual in the healthy state and to those who are in the unhealthy state due to an acute event. These rates determine the transitions from healthy to unhealthy due to a chronic event. It also determines the transitions from unhealthy to unhealthy state for those who had suffered an acute event but who also develop a chronic condition. This is an irreversible transition to the unhealthy state. 
+3. Using the new health status we compute the health spending and modify the mortality rate for that year.
+4. Finally we apply the updated mortality rate to determine the death events. 
+
+## Based on Adrienne's email: 
+In terms of integrating into the full model, it seems like it would make sense to create indicator variables for “chronic” and “acute”. Here’s an example setup:
+
+* If HealthStatus==Good. (then by definition CHRONIC==0)
+  + Binomial trial for development of chronic condition.
+    + If success, HealthStatus $\to$ bad, CHRONIC $\to$ 1.  Break
+* Binomial trial for development of acute condition.
+  + If success, HealthStatus $\to$ bad, ACUTE $\to$ 1. Break
+* If HealthStatus==Bad
+  + If CHRONIC==1, break
+  + If ACUTE==1 & CHRONIC ==0 , binomial trial for recovery.
+    + If success, HealthStatus $\to$ good, ACUTE $\to$ 0
+  + If ACUTE==1 & CHRONIC ==0 , binomial trial for development of chronic condition
+    + If success, HealthStatus stays bad, CHRONIC $\to$ 1.  Break
+
+# Initial Population Health Status
+
+We can use the fitted $l_x^{[MEPS]}$ together with the inital proportion of healthpeople at age 1 to create a table that can be usedto sample individual's health status.
+```{r echo=FALSE}
+max.pop <-apply(meps.lx[,c("lx.m","lx.f")],2,max)
+tmp<- lt.meps %>%  select(x,lx.m,lx.f)
+tmp$lx.m <- tmp$lx.m*max.pop["lx.m"]
+tmp$lx.f <- tmp$lx.f*max.pop["lx.f"]
+sampling.table <- rbind(c(0,1,1),tmp)
+sampling.table<- left_join(sampling.table,cdc.reduced,by="x")
+print(head(sampling.table))
+print(tail(sampling.table))
+```
+
+Therefore the table above can be used to seed individual's health status. For example an 81 year old female will be seeded to be in a bad health status with probability of 17%. Conditional on the bad health status she will have an 89% chance that the bad health status is due to a chronic condition. 
+
+However, the table above should be used with a correction for year 0. Based on CDC overall prevalence of major birth defects ststistics^[CDC overall prevalence of major birth defects:  https://www.cdc.gov/mmwr/preview/mmwrhtml/mm5701a2.htm and https://www.cdc.gov/ncbddd/birthdefects/data.html],  birth defects affect one in every 33 babies (about 3% of all babies) born in the United States each year. Hence, at age 0 and for any births we will need to use a 3% probability of placing new borns into a chronic bad health status.  
+
+# Sensitivity Ranges
+
+As explained, in order to make our $l_x^{[All-Health]}$  agree with $l_x^{[MEPS]}$ we had to add an additional age-dependent hazard rate for the acute events. This addition was found by a manual search. In order to explore sensitivity to our model assumptions and rates a good place to start is to use the hazard rates that are produced when we do not add in this correction. The table below provides these alterative hazard rates that can be used as inputs to the simulation model to test for model sensitivity.  
+
+```{r echo=FALSE}
+
+mx.acute<-mx.all.no.correction-mx.chronic
+
+
+
+lt.m<-(LifeTable(x,  mx=mx.acute$mx.m))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.f<-(LifeTable(x,  mx=mx.acute$mx.f))$lt %>% 
+  select(x,mx,lx) %>% 
+  mutate(lx=lx/1e5)
+lt.acute<- left_join(lt.m,lt.f,by="x",suffix=c(".m",".f"))
+
+morbid.model.acute.no.correction<- lt.acute 
+morbid.model.acute.no.correction <-morbid.model.acute.no.correction %>%
+  mutate(gx = a*exp(-log(2)*x/t.half),
+         bx.m = mx.m+(1/lx.m-1)*gx,
+         bx.f = mx.f+(1/lx.f-1)*gx )
+
+morbid.model.chronic<- lt.chronic 
+transition.rates.no.MEPS.correction<-left_join(morbid.model.chronic %>% select(x,mx.m,mx.f), morbid.model.acute.no.correction %>% select(x, bx.m,bx.f,gx),by="x") %>% 
+  rename(chronic.male=mx.m,chronic.fremale=mx.f,acute.male=bx.m,acute.female=bx.f,acute.recov=gx)
+
+print(head(transition.rates.no.MEPS.correction))
+print(tail(transition.rates.no.MEPS.correction))
+```
+
+# References & Footnotes
+
+```{r Save}
+save(transition.rates,sampling.table,file="../Integration/health_stat_transitions.Rda")
+```
+

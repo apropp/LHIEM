@@ -1,0 +1,172 @@
+---
+title: "Modeling Births"
+output: html_notebook
+bibliography: ../../WriteUp/bibliography.bib
+---
+  
+# Introduction
+
+This notebook follows on from the notebook on modeling Mortality. Here we focus on modeling pregnancy, its associated health expenditures and adding the new cohort of newborns into the population for our simulation model.   
+
+```{r include=FALSE}
+remove(list = ls())
+library(here)
+library(openxlsx)
+library(measurements)
+library(spatstat)
+library(MortalityLaws)
+library(ggplot2)
+library(scales) 
+library(reshape2)
+library(cdlTools)
+library(tidyverse)
+library(cowplot)
+getwd()
+#setwd("/Users/rvardava/OneDrive - Rand Corporation/Temp_RAPP")
+
+clean.num.entries<-function(dat,col=NULL){
+  if(is.null(col))(col<- colnames(dat)[-1])
+  for(i in col){
+    dat[,i] <- gsub(",","",dat[,i])
+    dat[,i] <- gsub("<","",dat[,i])
+    dat[,i] <- gsub("\\(.*","",dat[,i])
+    dat[,i] <- as.numeric(dat[,i])
+  }
+  return(dat)
+}
+```
+
+# Birth rate
+
+We begin by searching for a dataset for fertility or birth rates. A large data set is available from the CDC^[https://www.cdc.gov/nchs/data_access/Vitalstatsonline.htm], however here we will use CDC summary tables that provide the 2017 birth rate for mother by age group, race and state^[https://www.cdc.gov/nchs/data/nvsr/nvsr68/nvsr68_01-508.pdf]. We will focus on the national levels and not consider this by State. The table below gives US 2017 birth rates by mother's age group and race and the totalnumber of births.  
+```{r echo=FALSE}
+Predicted.Mx.output.file <- "NoteBooks/Fertility/Data/BirthRateUS2017.xlsx"
+br<-read.xlsx(here(Predicted.Mx.output.file))
+print(br)
+```
+The second column called *births* gives the total number of births by race. Note that the births by race do not add up to the total births given by the rown labeled *All*. So there must be something missing from the tables given in the CDC report. Starting from the third column we have the birth rate. This is to be interpreted as the yearly probability that a mother of the given age group (shown by the column titles) of a given race gives birth to a newborn. We reshape this table into a long format read to useas a lookup table.   
+```{r echo=FALSE}
+br.lookup <- melt(br,id="mothers")
+colnames(br.lookup) <- c("race","ageg5","birth.rate")
+
+br.lookup<- br.lookup %>% 
+  filter(ageg5!="births") %>% 
+  mutate(gender="Female")
+print(head(br.lookup))
+```
+
+# Births in the Modeled Synthetic Population
+
+We will use this lookup table to stochastically generate pregncy events and to grow of sythetic population. For the purpose of this Notebook we use the MEPS data as our example initial synthetic population. The table below showsa selection of candidate individuals/records that are in the pregancy age together with the birth rate taken from the lookup table.
+```{r echo=FALSE}
+meps.file <- "meps_current_2014.dms"
+meps.compare <- get(load(file=here(meps.file)))
+
+meps <- meps.compare %>% 
+  dplyr::select(dupersid,sex,age,totexp,oopexp,insurance.category,health.status,race,hispanic,w) %>% 
+  mutate(gender=dplyr::recode(sex, `1`= "Male",`2`="Female"),
+         ageg5 =(cut(age,breaks= seq(0,100,5),include.lowest = F,right=F))) %>% 
+  rename(race0 =race)
+
+meps$race <- "all"
+meps$race[meps$race0==1 & meps$hispanic==0] <- "white"
+meps$race[meps$race0==2 & meps$hispanic==0] <- "black"
+meps$race[meps$hispanic==1] <- "hispanic"
+
+pop<-meps %>%
+  dplyr::select(-race0) %>% 
+  left_join(br.lookup,by=c("race","ageg5","gender")) %>% 
+  mutate(n.children=0,
+         totexp.extra=0)
+
+tmp <-pop[pop$gender=="Female" & pop$ageg=="[25,30)",c("dupersid","race","ageg5","gender","birth.rate")]
+print(tmp[sample(nrow(tmp),20),])
+```
+
+## Mothers giving Birth Population
+
+Using the birthrate we stocastically generate births. This is done assumping a Bernoulli process. We create a subpopulation of mothers called *pop.mothers.giving.birth* that have given birth. We create a new column that tracks the number of children associated to each mother. 
+```{r}
+pop.mothers.giving.birth <- pop %>% 
+  filter(!is.na(birth.rate)) %>% 
+   mutate(births=as.logical(rbinom(nrow(.),1,birth.rate))) %>% 
+  filter(births) %>% 
+  mutate(n.children=n.children+1)
+```
+
+## Verification 
+Before proceeding further let's verify that the stochastic processs that use the birth rates produces the expected yearly number of births given in the CDC tables.
+```{r echo=FALSE}
+tab.births<-pop.mothers.giving.birth %>% 
+  group_by(race) %>% 
+    summarise(N=round(sum(w),0) ) 
+
+tab.births$N[tab.births$race%in%"all"]<-sum(tab.births$N)
+print(tab.births)
+```
+We see that these numbers colosely match the ones given by the CDC.
+
+# Newly Born Population
+
+From the mothers thatgive birth population - we generate the population of newborns. We will need to initialize many oftheir attributes. We assume that:
+
+1. Their race and population weight is the same as that of their mother.
+2. Their specific gender is equally probably.
+3. Their health status is selected stochastically by a Binomial distribution of size 5 with mean taken from the MEPS population of 0 year old. 
+4. They start with no standard health expenses. Recall that we use the standard health expenses to compute mortality rates. 
+5. There maybe some medical expenditures associated with birth  (e.g., neonatal intensive care unit). We create a column called *totexp.extra* for this. This addional expense depends on the health status. We will need to quantify this. For now I'm assuming a quandratic dependence of *totexp.extra* on *health.status*.   
+6. The person id of the newborn is the same person id of the mother with an added character string. This string takes the form "-n" where n is the number of children the mother has given birth to.
+
+## Health Status of Newborns
+
+Let's find the mean health.status of newborns and their distribution from the MEPS and let's compare this to the one stochastically generated via a Binomial random variable. 
+```{r}
+infant.health.meps <- mean(meps$health.status[meps$age<1])
+print(infant.health.meps)
+tmp<-rbinom(10000, 4, (infant.health.meps-1)/4)+1
+print(mean(tmp))
+
+quantile(meps$health.status[meps$age<1],prob=c(0,0.5,0.75,0.8,0.85,0.9,0.925,0.95,0.98,1))
+quantile(tmp,prob=c(0,0.5,0.75,0.8,0.85,0.9,0.925,0.95,0.98,1))
+```
+
+## Initializing the Newly Born Population
+
+Using the Binomial distribution for health.status we generate their *totexp.extra*  and all the other inital condition. 
+```{r}
+pop.births <- pop.mothers.giving.birth %>% 
+  mutate(sex= rbinom(nrow(.),1,0.5)+1) %>% 
+  mutate(dupersid=paste(dupersid,n.children,sep="-"),
+         age=0,ageg5="[0,5)",birth.rate=NA,
+         totexp=NA,oopexp=NA,
+         gender=dplyr::recode(sex, `1`= "Male",`2`="Female"),
+         health.status=rbinom(nrow(.), 4, (infant.health.meps-1)/4)+1,
+         totexp.extra = rpois(nrow(.),health.status^2*1000),
+         n.children=0)  %>% 
+  select(-births)
+```
+The *totexp.extra* is generated using a Poisson distribution. **TODO** this is something we need to model better using data.
+
+## Cost of pregnancy
+
+The cost of pregancy varies considerably by state and depending on various types of complications. There are various sources for pregnancy costs. Here we will rely on some summary tables^[https://blogs.scientificamerican.com/sa-visual/the-cost-of-giving-birth-in-the-u-s/]. These suggest that national averages range between \$12k to \$30k. However as a **TODO**, we may want to find a better source of these costs^[Maybe need to query the original source ofthis data available at https://hcupnet.ahrq.gov/#setup]. We assume that pregancy costs follow a log-normal distribution and hence have a long tail. Again, we should look into the data to get a better estimate of the mean and find the best fit variance parameter value.  
+```{r}
+pop.mothers.giving.birth<- pop.mothers.giving.birth %>% 
+  mutate(totexp.extra =pmax(rlnorm(nrow(.), meanlog = 8, sdlog =1.7), 12000) )
+summary(pop.mothers.giving.birth$totexp.extra)
+```
+
+
+# Updating the Population and Growing it
+
+Having generated and updated the population of mothers giving birth, and the population of newborns, we now update the full synthetic population.
+We first remove the records of the mothers giving birth from our starting population. We then append the updated population of mothers giving birth, and the population of newborns.
+```{r}
+pop<- pop[!(pop$dupersid%in%pop.mothers.giving.birth$dupersid),]
+pop <- rbind(pop,pop.mothers.giving.birth %>% select(-births)  )
+pop <- rbind(pop,pop.births)
+```
+
+```{r AP}
+save(infant.health.meps,file="infant_health.Rda")
+```

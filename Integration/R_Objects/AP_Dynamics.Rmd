@@ -1,0 +1,420 @@
+---
+title: "Predicting The Dynamics of Health Status"
+output: html_notebook
+bibliography: ../../WriteUp/bibliography.bib
+---
+
+# Introduction
+
+In this notebook our aim is to develop a simple model of health status dynamics by gender, age and possibly race that can be integrated as part of the simulation model of the dynamics. Our approach will be to construct a relatively simple model with just two health status states: good and bad health. A more sophisticated model would consider specific acute and chronic health conditions and their gender and age related hazard rates. Such data can be collected from specific papers or from the team working on the Future Americans Model (FAM).
+<!-- 1. Diabeties^[see the plot in https://jamanetwork.com/journals/jama/fullarticle/197439 and Figure 1 https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2748236/ also see https://www.livestories.com/statistics/us-diabetes-deaths-mortality which uses data available at https://wonder.cdc.gov/].  -->
+<!-- 2. Cardivasular Diseases -->
+<!-- 3. Cancers^[see https://onlinelibrary.wiley.com/doi/full/10.3322/caac.21551 Table 3 and Figure 4]  -->
+<!-- 4. General Disability and Morbidity life tables^[See the plot on page 29 of the WHO Scientific Group on the Epidemiology of Aging & World Health Organization. (1984). The uses of epidemiology in the study of the elderly : report of a WHO Scientific Group on the Epidemiology of Aging [meeting held in Geneva from 11 to 17 January 1983]. World Health Organization. https://apps.who.int/iris/handle/10665/39136. This is also presented on page 17 https://books.google.com/books?id=jTTUBwAAQBAJ&printsec=frontcover&hl=it&source=gbs_ge_summary_r&cad=0#v=onepage&q&f=false]. -->
+
+<!-- @Narayan2003 -->
+
+<!-- @Pencina:2009aa -->
+
+<!-- ```{r fig.height=4, fig.width=8,echo=FALSE} -->
+<!-- ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t1.png")) -->
+<!-- ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t2.png")) -->
+<!-- plot_grid(ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t3.png")), -->
+<!--           ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/m_joc30682t4.png")), -->
+<!--           ncol=2,scale=1) -->
+<!-- ``` -->
+
+Our approach here is instead to 
+
+1.	First get the hazard rate for developing any chronic condition as a function of age and gender. We can do this step by using WHO data for US females that provides the proportion of the population surviving without a progressive chronic degenerative disease (PCDD) as a function of age^[See the plot on page 29 of the WHO Scientific Group on the Epidemiology of Aging & World Health Organization. (1984). The uses of epidemiology in the study of the elderly : report of a WHO Scientific Group on the Epidemiology of Aging [meeting held in Geneva from 11 to 17 January 1983]. World Health Organization. https://apps.who.int/iris/handle/10665/39136. This is also presented on page 17 https://books.google.com/books?id=jTTUBwAAQBAJ&printsec=frontcover&hl=it&source=gbs_ge_summary_r&cad=0#v=onepage&q&f=false].. The same data provides a second curve giving the proportion surviving for the same population. From these two curves we can get the respective hazrad rates.
+2. For each age we take the ratio of the PCDD hazard rate to the mortality rate. We **assume** that this ratio is descriptive of both genders and is stationary over time. Hence this ratio as a function of age can be used to compute the more recent PCDD hazard rates for both males and females.
+3. Using CDC statistics that provide the proportion of the 10 leading causes of deaths by age groups we find the proportion of deaths due to PCDDs and the proportion of deaths due to acute events (e.g., injuries, accidents, suicides and homicides). We use these proportions together with the PCDD hazard rates to estimate the acute event hazard rate. Note that this estimated hazard rate describes the risk of an acute event and not the risk of death from an acute event. Hence, fundamentally here we **assume** that the CDC proportions describing the different causes of deaths can be equally interpreted as the proportions of the events for developing the conditions that eventually lead up to those death events.^[This is a strong assumption because especially at younger ages there may be many more injuries that don't eventually lead up to a death compared to chronic disease conditions that do.]      
+
+```{r include=FALSE}
+remove(list = ls())
+library(here)
+library(openxlsx)
+library(measurements)
+library(spatstat)
+library(MortalityLaws)
+library(ggplot2)
+library(scales) 
+library(reshape2)
+library(cdlTools)
+library(tidyverse)
+library(cowplot)
+getwd()
+#setwd("/Users/rvardava/OneDrive - Rand Corporation/Temp_RAPP")
+
+clean.num.entries<-function(dat,col=NULL){
+  if(is.null(col))(col<- colnames(dat)[-1])
+  for(i in col){
+    dat[,i] <- gsub(",","",dat[,i])
+    dat[,i] <- gsub("<","",dat[,i])
+    dat[,i] <- gsub("\\(.*","",dat[,i])
+    dat[,i] <- as.numeric(dat[,i])
+  }
+  return(dat)
+}
+```
+
+
+# Gathering the data from tables and figures
+
+As mentioned, we are going to use a simple approach based on using a life-table describing health status. I haven't found anything which is recent - but a WHO report in 1984 refereed to in the footnotes provides a plot of what we need. We can get the data from this plot which applies to US females in 1980 and find the difference between morbidity and mortality by age. More precisely we can find the ratio of morbidity to mortality by age and assume that hazard risk rate of morbidity to mortality as a function of age is stationary over time and is the same for both genders^[Note the quantity $m_x$ in life-tables gives the central rate of mortality as a function of age $x$. I call it the hazard rate for mortality but it is approximately equal to the average force of mortality $\mu_x$, averaged over the year of age or $m_x= \mu_{x+1/2}$ (see https://rss.onlinelibrary.wiley.com/doi/pdf/10.1111/rssa.12309), where $\mu_x$ is actually the hazard rate.]. Then using the most recent data for the mortality tables we can estimate the morbidity life-tables by assuming that this ratio is the same as that in 1980 and applies to both females and males. 
+```{r fig.height=4, fig.width=8,echo=FALSE}
+ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/Disability_curve.png"))
+```
+
+The morbidity curve that the WHO reports gives the probability of surviving without a progressive chronic degenerative disease (PCDD). We will **assume** that a PCDD is a disease that cannot be cured but only treated, and conditions never improve. In other words PCDD morbidity is an irreversible or an absorbing state. 
+
+We can use the program automeris to extract the data mortality and morbidity data from these plots^[ https://apps.automeris.io/wpd/.]. The plots of $l_x$ of the extracted data is shown below. From the values of $l_x$ for mortality and morbidity we compute the mortality and morbidity rates $m_x$ using the **MortalityLaws** package. In finding the $l_x$ and $m_x$ values by age we appliedsome smoothing.  
+```{r echo=FALSE}
+WHO.Morbid.data.file <- "NoteBooks/Health Status/Data/Morbid_WHO1984_Females.csv"
+WHO.Morbid.data<-read.csv(here(WHO.Morbid.data.file),header = TRUE)
+model.morb <- loess(Morbid~Age,data= WHO.Morbid.data,span=0.3)
+WHO.Mort.data.file <- "NoteBooks/Health Status/Data/Mort_WHO1984_Females.csv"
+WHO.Mort.data<-read.csv(here(WHO.Mort.data.file),header = TRUE)
+model.mort <- loess(Mort~Age,data= WHO.Mort.data,span=0.3)
+
+WHO.data<- cbind.data.frame(Age=seq(0,105,by=1),Morbid=NA, Mort= NA)
+WHO.data$Morbid <- pmax(predict(model.morb,newdata =WHO.data)/100,0)
+WHO.data$Mort <- pmax(predict(model.mort,newdata =WHO.data)/100,0)
+WHO.data[1,c(2,3)] <- 1
+WHO.data$Morbid <-pmin(WHO.data$Morbid,WHO.data$Mort)
+
+lt.morb.WHO84<-(LifeTable(WHO.data$Age,  lx=1e5*WHO.data$Morbid))$lt
+lt.mort.WHO84<-(LifeTable(WHO.data$Age,  lx=1e5*WHO.data$Mort))$lt
+
+who<-cbind.data.frame(lt.mort.WHO84[,c(1,2)],morb=lt.morb.WHO84$mx,mort=lt.mort.WHO84$mx,
+                      morb.lx=lt.morb.WHO84$lx/1000,mort.lx=lt.mort.WHO84$lx/1000)
+
+big <- 18
+small <- 12  
+dat.p<- who %>% 
+  select( x,morb.lx, mort.lx) %>% 
+ gather(type,lx,-x)
+
+p <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion surviving (%)"
+      ) +
+  ggtitle("WHO data Female 1980 morbidity and mortality")+
+   scale_colour_manual(values = c("blue","red"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p)
+```
+
+```{r echo=FALSE}
+who$morb <- pmax(who$morb,who$mort)
+model.morb.to.mort <- loess(morb~mort,data= who,span=0.3)
+who$morb.predict <- predict(model.morb.to.mort)
+who$ratio <- pmin(5,who$morb.predict/who$mort)
+dat <- who
+```
+
+Now, there is an additional issue. The curve in red above gives the $l_x$ of all-cause mortality rate while the blue curve gives the morbidity $l_x$ just for the PCDD. From these $l_x$ values we can compute the hazrad rates $m_x$ for both and take the ratio. However, if we want to compute a ratio we need both the numerator and denominator to respectively reflect the hazard of developing a PCDD and the mortality hazard of PCDDs (instead of the all-cause mortality rate). 
+
+To obtain the mortality rate that is due just to the PCDD component from the all-cause mortality we will use recent CDC tables^[https://www.cdc.gov/nchs/data/nvsr/nvsr68/nvsr68_06-508.pdf]. These tables provide the proportion of leading causes of death for 2017 by age and gender to get the proportion of deaths due to chronic conditions and those due to acute conditions. We then assume that the chronic morality hazard rate is equal to the all-cause morality hazard rate multiplied by the chronic proportion. Hence, $$m_x^{[PCDD]}= p_x^{[PCDD]}m_x^{[all-cause]}$$.
+
+Figure 2 in the CDC report provides pie charts giving the percent distribution of the 10 leading causes of death, by age group: United States, 2017. These 10 leading causes are Heart disease, Cancer, Chronic lower respiratory diseases, Stroke (cerebrovascular diseases),  Alzheimer’s disease,  Diabetes,  Influenza and Pneumonia,  Nephritis (including nephrotic syndrome and nephrosis), Accidents and Intentional self-harm (suicide). The latter two are acute cases while the first 8 are chronic cases. The pie charts include an additional cause that aggregate all the other causes. It is unclear if these other causes are mainly chronic or acute.
+
+```{r fig.height=8, fig.width=7,echo=FALSE}
+ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/CDC2017.png"),height=1,scale=1)
+```
+
+The table below uses the pie chart data above and provides the proportion of deaths that are due to chronic versus acute events in 2017. We use assume that the chronic mortality rate is given by the multiplication of this proportion with the all-cause mortality rate. 
+```{r echo=FALSE, warning=FALSE}
+CDC.data <- "NoteBooks/Health Status/Data/CDC_10_leading_causes_of_death_2017.xlsx"
+cdc.summary<- read.xlsx(here(CDC.data),sheet=1)
+print(cdc.summary)
+CDC.data <- "NoteBooks/Health Status/Data/CDC_10_leading_causes_of_death_2017.xlsx"
+cdc<- read.xlsx(here(CDC.data),sheet=2)
+cdc.continous.model <- loess(chronic~x,data= cdc,span=0.3) 
+cdc$chronic <- predict(cdc.continous.model)
+cdc$acute<- 1-cdc$chronic
+```
+
+
+# Computing the ratio of the hazards for morbidity to morality 
+
+Finally, we can compute this ratio. Thus, the ratio for the WHO data for the 1980 US women as a function of age $x$ can be calculated as $$r^{[w1980]}_x= \frac{s_x^{[w1980]}}{p_x^{[PCDD]}m_x^{[w1980]}}$$, where $s_x^{[w1980]}$ and $m_x^{[w1980]}$  are respectively the PCDD morbidity hazard and the all-cause mortality rate for US women in 1980. 
+
+```{r echo=FALSE}
+dat<- cbind(who, cdc[1:nrow(who),c("acute","chronic")])
+
+dat$chronic.mort.mx <- dat$chronic*dat$mort
+dat$chronic.morb.mx <- dat$morb.predict
+
+dat$ratio<- pmin(15,dat$chronic.morb.mx/dat$chronic.mort.mx)  #pmin(5,who$morb.predict/who$mort)
+ratio.model <- loess(ratio~x,data= dat,span=0.3)
+dat$ratio<- predict(ratio.model)
+
+dat <- dat %>% 
+  select(x.int,x,acute,chronic,chronic.mort.mx, chronic.morb.mx,ratio) %>% 
+  rename(PCDD.mort.mx.w1980=chronic.mort.mx,PCDD.morb.mx.w1980=chronic.morb.mx)
+head(dat)
+tail(dat)
+#plot(dat$x,dat$ratio)
+```
+
+We now assume that this ratio does not change over the years and applies equally to females and males. Meaning as people survive for more years, the PCDD morbidity is delayed accordingly. Hence, $$s_x^{[2018]}=r^{[w1980]}_x p_x^{[PCDD]} m_x^{[2018]}$$, an we can generate the current PCDD morbidity hazard for both males and females using the recent life-tables and mortality rates for males and females.   We load the male and female 2018 mortality rates $m_x^{[2018]}$ and calculate the $s_x^{[2018]}$.
+
+We now load the 2018 US life-tables and get the male and female all-cause mortality rates. We use these to compute the PCDD hazard rate $s_x^{[2018]}$ for males and females. Due to the discontinuous jumps in the chronic versus acute proportions in  the CDC data we apply some smoothing to the resulting $s_x$ hazards. In particular the smoothing using the computed $s_x^{[2018]}$ and fits the most representative Gompertz–Makeham law^[https://en.wikipedia.org/wiki/Gompertz%E2%80%93Makeham_law_of_mortality]. This means that the PCDD hazard rate can be expressed as $s_x^{[2018]}=ae^{bx}+c$ where the coefficients $a,b$ and $c$ are found by the fitting. 
+
+```{r echo=FALSE}
+Predicted.Mx.output.file <- "Data/US_mortality_tables.csv"
+mx<-read.csv(here(Predicted.Mx.output.file))
+
+mx <- mx %>% 
+  mutate(gender=dplyr::recode(male, `1`= "Male",`0`="Female")) %>% 
+  rename(age=Age, year=Year, mx=mort.prob ) %>% 
+  select(-male) %>% 
+  filter(year==2018)
+
+mx.m<- mx[mx$gender=="Male",]
+mx.f<- mx[mx$gender=="Female",]
+
+lt.m<-(LifeTable(mx.m$age,  mx=mx.m$mx))$lt
+lt.f<-(LifeTable(mx.f$age,  mx=mx.f$mx))$lt
+
+morbid.model<-cbind(dat[,c("x.int","x","ratio","chronic")],mx.m=lt.m$mx[1:nrow(who)],mx.f=lt.f$mx[1:nrow(who)])
+
+morbid.model$sx.m <- morbid.model$ratio*morbid.model$chronic*morbid.model$mx.m
+morbid.model$sx.f <- morbid.model$ratio*morbid.model$chronic*morbid.model$mx.f
+
+M1<-MortalityLaw(morbid.model$x,  mx=morbid.model$sx.m,law="makeham")
+coeff<-M1$coefficients
+morbid.model$sx.m<- coeff["A"]*exp(coeff["B"]*morbid.model$x)+coeff["C"]
+
+M1<-MortalityLaw(morbid.model$x,  mx=morbid.model$sx.f,law="makeham")
+coeff<-M1$coefficients
+morbid.model$sx.f<- coeff["A"]*exp(coeff["B"]*morbid.model$x)+coeff["C"]
+
+print(morbid.model[51:60,])
+```
+
+From the male and female $s_x^{[2018]}$ values we can use the Life-table function to reproduce the new curves describing the proportion of the population surviving without a progressive chronic degenerative disease (PCDD).
+```{r echo=FALSE}
+lt.m.morb.2018<-(LifeTable(morbid.model$x,  mx=morbid.model$sx.m))$lt
+lt.f.morb.2018<-(LifeTable(morbid.model$x,  mx=morbid.model$sx.f))$lt
+lt.m.mort.2018<-(LifeTable(morbid.model$x,  mx=morbid.model$mx.m))$lt
+lt.f.mort.2018<-(LifeTable(morbid.model$x,  mx=morbid.model$mx.f))$lt
+
+morbid.model$lx.m <- lt.m.mort.2018$lx/10^3
+morbid.model$lx.f <- lt.f.mort.2018$lx/10^3
+
+morbid.model$slx.m <- lt.m.morb.2018$lx/10^3
+morbid.model$slx.f <- lt.f.morb.2018$lx/10^3
+```
+We can then plot these new curves for males and females and compare it to the original WHO plot.
+```{r echo=FALSE}
+big <- 18
+small <- 12  
+dat.p<- morbid.model %>% 
+  select( x,slx.m, lx.m) %>% 
+ gather(type,lx,-x)
+
+p <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion surviving (%)"
+      ) +
+  ggtitle("Estimated Male 2018 PCDD morbidity and mortality")+
+   scale_colour_manual(values = c("red","blue"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p)
+
+dat.p<- morbid.model %>% 
+  select( x,slx.f, lx.f) %>% 
+ gather(type,lx,-x)
+
+p <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion surviving (%)"
+      ) +
+  ggtitle("Estimated Female 2018 PCDD morbidity and mortality")+
+   scale_colour_manual(values = c("red","blue"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p)
+
+```
+Thus, this wraps our irreversible transition rate from good to bad health due to the onset of a PCDD as a function of gender and age. The table below gives our look-up table for the transition probabilities.  
+```{r echo=FALSE}
+morbid.model<- morbid.model %>% 
+  select(x,sx.m,sx.f,lx.m ,lx.f)
+print(morbid.model[51:60,])
+
+```
+
+
+# Acute Health Events
+
+Having modeled the irreversible transitions from good to bad health due to the onset of a chronic condition - we now move to model the reversible transition rates between good and bad health due to an acute event. The diagram below shows the difference in conceptualization between the chronic and the acute conditions for any given age.  
+
+```{r fig.height=4, fig.width=7,echo=FALSE}
+ggdraw() + draw_image(here("NoteBooks/Health Status/Figures/SimpleTransitionModel/Slide1.png"),height=1,scale=1)
+```
+The net hazard rate from good to bad health by gender and by age for acute events can be easily obtained using the CDC proportions for the acute and comparing them to the chronic conditions.
+Basically, we get the proportion of acute to chronic events from the CDC data as shown in the table below, and apply this ratio by age group to the chronic $s_x^{[2018]}$ we just computed. 
+```{r echo=FALSE}
+cdc.summary$acute.to.chronic <- cdc.summary$acute/cdc.summary$chronic
+print(cdc.summary)
+cdc$acute.to.chronic <- cdc$acute/cdc$chronic
+morbid.model.acute <- morbid.model
+morbid.model.acute$sx.m <- morbid.model$sx.m*cdc$acute.to.chronic[1:nrow(morbid.model)]
+morbid.model.acute$sx.f <- morbid.model$sx.f*cdc$acute.to.chronic[1:nrow(morbid.model)]
+```
+Based on the net transition from good to bad health we can generate the curves below. These curves assume that chronic conditions do not occur, nor do deaths, and only acute health events occur. They show the proportion of males and females as a function of age that remain in good health without experiencing an acute event of the type that would lead to a transition from good to bad health. Thus assuming that all males survive to age 100, the curve shows that roughly 70% would not have experienced an acute health event.    
+```{r echo=FALSE}
+lt.m.morb.2018<-(LifeTable(morbid.model.acute$x,  mx=morbid.model.acute$sx.m))$lt
+lt.f.morb.2018<-(LifeTable(morbid.model.acute$x,  mx=morbid.model.acute$sx.f))$lt
+
+morbid.model.acute$slx.m <- lt.m.morb.2018$lx/10^3
+morbid.model.acute$slx.f <- lt.f.morb.2018$lx/10^3
+
+big <- 18
+small <- 12  
+dat.p<- morbid.model.acute %>% 
+  select( x,slx.m, slx.f) %>% 
+ gather(type,lx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("female","male")
+
+p <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = lx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Proportion surviving (%)"
+      ) +
+  ggtitle("Estimated 2018 acute event morbidity")+
+   scale_colour_manual(values = c("pink","lightblue"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p)
+
+```
+However, as illustrated by our figure above this only computes the net transition from good to bad health status. Instead we want a model that considers reversibility of health status. From Life-Table theory, if $q_x^{[mort]}$ represents the probability that a person of age $x$ will die within one year and $l_x^{[mort]}$ the number of persons surviving to age $x$, then $l_x^{[mort]} = l_{x-1}^{[mort]}(1-q^{[mort]}_{x-1})$. We can use similar logic and instead define $b_x$ to represent the probability that a person in good health of age $x$ will experience an acute health event taking him/her from good to bad health, $g_x$ a person in bad health of age $x$ will experience an acute health event taking him/her from  bad to good health, we define $l_x$ to be the number of persons in good health. Hence, the number of persons in bad health is $l_x^{[mort]}-l_x$. Hence we can write $$l_x q_x= l_x b_x -(l_x^{[mort]}-l_x)g_x=l_x(b_x+g_x)-g_x l_x^{[mort]}$$, where here $q_x$ represents a net probability of the irreversible process going from good to bad health which we have just quantified. Thus we know, $l_x$, $l_x^{[mort]}$ and $q_x$. We can thus make some assumptions regarding the rate $g_x$ which describes how fast a person who experienced an acute heath event recovers back to good health. A reasonable assumption is that this recovery rate is an exponentially decreasing function with age such that it is close to being a zero rate once a person reaches old age (e.g., 70+). A reasonable estimate for recovery duration in younger ages is of the order of a year. Thus, $g_x\sim a e^{-\log(2) x/t_{1/2}}$, with $g_0^{-1} \sim 1$ year and $g_{70}^{-1} \sim 30$ years.  Thus we can set $a=1$ and the half-life $t_{1/2}= 70 \log(2)/\log(30)=14.26$ years. Note that the parameters $a$ and $t_{1/2}$ could be varies and used as calibration parameters. By specifying the function for $g_x$ we can find $b_x$ as $$b_x=q_x +(l_x^{[mort]}/l_x-1)g_x$$. When we apply this function to our data we get the rates shown in the plot below. Note that at age 0, the rate from good to bad (i.e., $b_x$) is the same as the net rate ($q_x$), this is because there is no one yet who has experiences an acute event and needs to recover from it. Then with age, the rate $b_x$ becomes bigger in order to balance out the recovery transitions from bad to good $g_x$ and recover our net rate $q_x$. However, for much older ages the rate $g_x$ becomes negligible and thus $b_x$ approaches $q_x$ asymptotically.   
+```{r echo=FALSE}
+a<- 1
+t.half<- 14.26
+
+# Note the equations below seem to be a slight devation from what is written in the text. 
+# First we divide the lx's by 100 to get a proportion. More importantly lx-lx*slx represents the number people in bad health which has to be a +ve number.  
+morbid.model.acute <- morbid.model.acute %>%
+  mutate(gx = a*exp(-log(2)*x/t.half),
+         bx.m = sx.m+(lx.m/100-lx.m*slx.m/10^4)/(lx.m/100)*gx,
+         bx.f = sx.f+(lx.f/100-lx.f*slx.f/10^4)/(lx.f/100)*gx )
+
+
+dat.p<- morbid.model.acute %>% 
+  select( x,sx.m, bx.m,gx) %>% 
+ gather(type,mx,-x)
+
+dat.p$type <- as.factor(dat.p$type)
+levels(dat.p$type)<- c("good->bad","bad->good","net")
+
+p <- ggplot(data = dat.p)+
+      geom_line(aes(x = x, y = mx,color=type), size = 2) +
+      labs(
+        x = "Age",
+        y = "Transition Prob for acute condition"
+      ) +
+  scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x),
+              labels = trans_format("log10", math_format(10^.x)))+
+  ggtitle("Acute Transition Prob")+
+   scale_colour_manual(values = c("pink","lightblue","green"))+
+  scale_x_continuous(breaks = c(0:10)*10)+
+      theme_bw() +
+      theme(
+        plot.title = element_text(color="black", size=big, face="bold.italic"),
+        legend.title = element_blank(),
+            #legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p)
+```
+
+# Transition Probabilities that enter the simulation
+
+Finally, we compile the transition probabilities that can be used as inputs to the simulation model. The column names have been renames and made them more descriptive.
+
+```{r echo=FALSE}
+transition.rates<-left_join(morbid.model %>% select(x,sx.m,sx.f),morbid.model.acute %>% select(x, bx.m,bx.f,gx),by="x") %>% 
+  rename(chronic.male=sx.m,chronic.fremale=sx.f,acute.male=bx.m,acute.female=bx.f,acute.recov=gx)
+
+print(head(transition.rates))
+print(tail(transition.rates))
+```
+
+
+
+

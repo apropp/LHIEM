@@ -1,0 +1,483 @@
+---
+title: "Predicting Mortality from Health Spending"
+output: html_notebook
+bibliography: ../../WriteUp/bibliography.bib
+---
+
+# Introduction
+
+Our aim here is to modify the US mortality rates by age and gender based on health costs. We start from US life tables that provide the all-cause mortality rates by age and gender taken from the The Human Mortality Database (HMD) ^[https://www.mortality.org/] and the UN Mortality projections for future years^[https://www.un.org/en/development/desa/population/theme/mortality/index.asp]. Our initial thought was to model the dynamics of health status by age. This would then be correlated to the health costs and would predict the mortality rate by using cause specific mortality rates. However, this is a long and complicated approach. The main reason is that the MyCare or Cuban plan simulation model we are focusing on the dynamics of health spending and prefer to use a more direct link to morality from health spending without needing to track heath status at an increased level of detail.      
+
+
+```{r include=FALSE}
+remove(list = ls())
+library(here)
+library(openxlsx)
+library(measurements)
+library(spatstat)
+library(MortalityLaws)
+library(ggplot2)
+library(scales) 
+library(reshape2)
+library(cdlTools)
+library(tidyverse)
+library(cowplot)
+library(magick)
+getwd()
+#setwd("/Users/rvardava/OneDrive - Rand Corporation/Temp_RAPP")
+
+clean.num.entries<-function(dat,col=NULL){
+  if(is.null(col))(col<- colnames(dat)[-1])
+  for(i in col){
+    dat[,i] <- gsub(",","",dat[,i])
+    dat[,i] <- gsub("<","",dat[,i])
+    dat[,i] <- gsub("\\(.*","",dat[,i])
+    dat[,i] <- as.numeric(dat[,i])
+  }
+  return(dat)
+}
+
+```
+
+# Life Tables
+
+In an project led by Rosalie Pacula to model alcohol consumption, we merged past and current HMD and projected UN life-table data to obtain US life tables that smoothly transition from the current HMD ones to the UN projects for all the way to 2099. As a brief review of life tables, these provide    
+
+1. $x_{int}$ : the age interval.
+2. $x$: age at the beginning of the interval.
+3. $q_x$ the probability that someone aged exactly $x$ will die before reaching age $x+1$.
+4. $m_x$: the rate of mortality at age $x+0.5$. Note for young people $m_x\sim q_x$. However, for very old people $m_x\sim q_x^{0.5}$, since mortality rate in the second half of the year is notably higher than the first. The exact relationship between $q_x$ and $m_x$ is controlled by $a_x$ which represents a proportion point for splitting the year between equal mortality rates on either parts of the year. 
+5. $l_x$: the number of people who survive to age $x$  starting from a population of $l_0=100,000$ at age 0. 
+
+The data we compiled gives $m_x$ by gender (and of course age $x$). Generating the other indicators is easily done using the package *MortalityLaws*. We will start by extracting the life tables for a given year - say 2018. 
+
+```{r echo=FALSE}
+Predicted.Mx.output.file <- "Data/US_mortality_tables.csv"
+mx<-read.csv((here(Predicted.Mx.output.file)))
+
+mx <- mx %>% 
+  dplyr::mutate(gender=dplyr::recode(male, `1`= "Male",`0`="Female")) %>% 
+  dplyr::rename(age=Age, year=Year, mx=mort.prob ) %>% 
+  dplyr::select(-male) %>% 
+  dplyr::filter(year==2018)
+
+
+
+mx.m<- mx[mx$gender=="Male",]
+mx.f<- mx[mx$gender=="Female",]
+
+lt.m<-(LifeTable(mx.m$age,  mx=mx.m$mx))$lt
+lt.f<-(LifeTable(mx.f$age,  mx=mx.f$mx))$lt
+
+print(head(lt.m))
+print(tail(lt.m))
+```
+
+# Health Spending as a function of Morality rate
+
+Using  Medicare claims data, @Einav1462 predicted mortality rates from the total Medicare spending in the 12 months after 1 January 2008. The figure form @Einav1462 shown below provides plots for (A) Kernel density of total Medicare spending in the 12 months after 1 January 2008 against predicted annual mortality. (B) Kernel density of Medicare spending separately for survivors and decedents. 
+```{r fig.height=4, fig.width=8,echo=FALSE}
+ ggdraw() + draw_image("../Mortality/Figures/MedicareSpending.jpg")
+```
+The idea is to invert the axes of plot A to create a look-up function to find the mortality yearly from the health care spending. However, we need to consider keep in mind that these plots make an average prediction for mortality based on spending of those on Medicare and hence aged 65+ only. So we need to disentangled the age effect and make assumptions of how we can extrapolate this relationship to younger ages. We will need to know the population distribution of those aged 65+ by age, their average spending, and their average morality rate. We will re-plot plot A scaling both axes by their averages and inverting the axes. Therefore, we will have how predicted mortality increases as a ratio of the average mortality with respect to the increase of the ratio of Total spending with respect to the average total spending. We will then assume that this plot can be applied to all ages.
+
+The first task is to extract the data from the plot. There is a nice tool called automeris which we used for this task^[This data extraction from a plot tool is freely available and can be accessed at https://apps.automeris.io/wpd/ . Note the tool allows for log scales. So this wasn't an issue for our task.]. 
+```{r echo=FALSE}
+Einav1462.data.file <- "../Mortality/Data/Einav1462_HealthSpendingMortality.csv"
+Einav1462.data<-read.csv(file.path(Einav1462.data.file),header = TRUE)
+#Einav1462.data<-rbind(Einav1462.data,c(0.95,100000))
+Einav1462.data$Mortality <- predict(loess(Mortality~Health.Spending,data= Einav1462.data,span=0.3))
+```
+
+Then we need expenditure data by age, and we desire to linking it to mortality rates given by the life tables. For this we use the MEPS. For now we will use an old processed version of the MEPS taken from COMPARE. This will need to be updated. We compute weighted statistics for total expenditure and for mortality, including mean, std dev, and quantiles. These statistics were obtained by using the MEPS data and merging it to the mortality rate $m_x$ by age and gender. We then filtered the resulting data to obtain the population of those age 65 and above with insurance category medicare. The MEPS weights were then used to get the weighted means. These statistics are respectively given below.   
+```{r echo=FALSE}
+meps.file <- "Data/meps_current_2014.dms"
+meps.compare <- get(load(file=(here(meps.file))))
+
+meps <- meps.compare %>% 
+  select(dupersid,sex,age,totexp,oopexp,insurance.category,health.status,w) %>% 
+  mutate(gender=dplyr::recode(sex, `1`= "Male",`2`="Female"))
+
+
+totexp.seniors.weighted.stats<-meps %>% 
+  filter(age>=65 & insurance.category=="medicare") %>% 
+  summarise(mean = weighted.mean(totexp,w,na.rm = T),
+            sd = sqrt(weighted.var(totexp,w,na.rm = T)),
+            `0%`=weighted.quantile(totexp,w,prob=0,na.rm = T),
+            `25%`=weighted.quantile(totexp,w,prob=0.25,na.rm = T),
+            `50%`=weighted.quantile(totexp,w,prob=0.5,na.rm = T),
+            `75%`=weighted.quantile(totexp,w,prob=0.75,na.rm = T),
+            `100%`=weighted.quantile(totexp,w,prob=1,na.rm = T)) %>%  
+  round(0)
+
+mx.seniors.weighted.stats<- meps %>%
+  select(age,gender,insurance.category,w) %>% 
+  left_join(mx,by=c("age","gender")) %>% 
+  filter(age>=65 & insurance.category=="medicare") %>% 
+    summarise(mean = weighted.mean(mx,w,na.rm = T),
+            sd = sqrt(weighted.var(mx,w,na.rm = T)),
+            `0%`=weighted.quantile(mx,w,prob=0,na.rm = T),
+            `25%`=weighted.quantile(mx,w,prob=0.25,na.rm = T),
+            `50%`=weighted.quantile(mx,w,prob=0.5,na.rm = T),
+            `75%`=weighted.quantile(mx,w,prob=0.75,na.rm = T),
+            `100%`=weighted.quantile(mx,w,prob=1,na.rm = T)) %>% 
+  round(4)
+
+seniors.weighted.stats <- rbind(totexp=totexp.seniors.weighted.stats,mx=mx.seniors.weighted.stats)
+print(seniors.weighted.stats)
+```
+
+We then proceed to produce the inverse plot of the data from @Einav1462 using some smoothing and overlaying some of these computed statistics. The plot is shown below. The vertical and horizontal dotted lines respectively refer to weighted statistics for spending and mortality taken from our merged MEPS Life Tables data. The orange lines refer to means, the dark red lines refer to medians and the dark green lines refer to the 25th and 75th percentile points.  As is well known in the MEPS there is a long tail distribution in spending and the mean spending is much larger than the median, and is even larger than the 75th percentile. predicted mortality rate on the other hand is less skewed and the mean is closer to the median. Due to the large skewness in spending, scaling this plot relative to mean spending is not a good idea. A better idea is to focus on the medians and scale this plot relative to the medians. Even better, we can focus on the point shown in blue which corresponds to the spending where the mean predicted mortality rate hits the green curve. Using the weighted MEPS data we can calculate this spending amount and the percentile it corresponds to.
+```{r echo=FALSE}
+totexp.at.mean.mx<-round(predict(loess(Health.Spending~Mortality,data=  Einav1462.data,span=0.3),seniors.weighted.stats["mx","mean"]),0)
+tmp <- meps[meps$age>=65 & meps$insurance.category=="medicare", c("totexp","w")] 
+percentile.totexp <- ewcdf(tmp$totexp,tmp$w/sum(tmp$w))
+totexp.at.mean.mx = c(mx=seniors.weighted.stats["mx","mean"],spending=totexp.at.mean.mx,spending.percentile=round(100*percentile.totexp(totexp.at.mean.mx),1))
+print(totexp.at.mean.mx )
+```
+We find that at the mean mortality rate of 0.029, the curve predicts \$5,635 of health spending which corresponds to the 56.4 percentile of health spending in the 65+ population. We will select this point as our reference point to scale things from. 
+```{r echo=FALSE}
+big <- 18
+small <- 12  
+p.inverse.smoothed= 
+      ggplot()+
+      geom_line(data = Einav1462.data, aes(x = Health.Spending, y = Mortality), 
+                color = "darkolivegreen4", size = 1) +
+            scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x,n=3)(c(0.005,0.01,0.05,1)), limits=c(0.005,1)) + #labels = trans_format("log10", math_format(10^.x))
+  scale_x_continuous(breaks=c(0,5000,10000,15000,20000,25000,30000,35000),limits=c(0.,30000))+
+      labs(
+        x = "Total Spending ($US)",
+        y = "Predicted Mortality"
+      ) +
+  geom_hline(yintercept = seniors.weighted.stats["mx","mean"] , linetype="dashed", 
+               color = "orange" , size=0.5,na.rm=T)+
+    geom_vline(xintercept = seniors.weighted.stats["totexp","mean"] , linetype="dashed", 
+               color = "orange" , size=0.5,na.rm=T)+
+      geom_hline(yintercept = as.numeric(seniors.weighted.stats["mx",c("25%","75%")]) , linetype="dashed", 
+               color = "darkolivegreen2" , size=0.5,na.rm=T)+
+      geom_vline(xintercept = as.numeric(seniors.weighted.stats["totexp",c("25%","75%")]) , linetype="dashed", 
+               color = "darkolivegreen2" , size=0.5,na.rm=T)+
+    geom_hline(yintercept = as.numeric(seniors.weighted.stats["mx",c("50%")]) , linetype="dashed", 
+               color = "coral3" , size=0.5,na.rm=T)+
+      geom_vline(xintercept = as.numeric(seniors.weighted.stats["totexp",c("50%")]) , linetype="dashed", 
+               color = "coral3" , size=0.5,na.rm=T)+
+    annotate("point", y = as.numeric(totexp.at.mean.mx["mx"]),
+                      x = as.numeric(totexp.at.mean.mx["spending"]), 
+             size=4,colour = "blue")+
+      theme_bw() +
+      theme(legend.title = element_blank(),
+            legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic",angle = 45),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p.inverse.smoothed)
+```
+```{r echo=FALSE}
+Einav1462.data.scaled<- Einav1462.data %>% 
+  mutate(Health.Spending.ratio= Health.Spending/totexp.at.mean.mx["spending"], 
+         Mortality.ratio= Mortality/totexp.at.mean.mx["mx"]) %>% 
+  select(Health.Spending.ratio,Mortality.ratio)
+
+range.factor <- 1/15
+Einav1462.data.scaled <- Einav1462.data.scaled %>% 
+  mutate( multi.Lower =exp(-(Health.Spending.ratio-1)*range.factor), multi.Upper =exp((Health.Spending.ratio-1)*range.factor))
+```
+
+
+The scaled plot is found by dividing the spending and the mortality rate by these numbers (i.e., specified by the blue point). This plot is shown below. The uncertainty band is found by assuming that the variability in mortality is higher as spending increases.   
+```{r echo=FALSE}
+p.inverse.smoothed.scaled= 
+      ggplot()+
+      geom_line(data = Einav1462.data.scaled, aes(x = Health.Spending.ratio, y = Mortality.ratio), 
+                color = "darkolivegreen4", size = 1) +
+  geom_ribbon(data = Einav1462.data.scaled,aes(ymin=Mortality.ratio*multi.Lower, ymax=Mortality.ratio*multi.Upper, x=Health.Spending.ratio), 
+              fill= "darkolivegreen3",alpha = 0.4)+
+            scale_y_log10(breaks = trans_breaks("log10", function(x) round(10^x,0),n=4)) + #labels = trans_format("log10", math_format(10^.x))
+ # scale_x_continuous(breaks=c(0,5000,10000,15000,20000,25000,30000,35000),limits=c(0.,30000))+
+      labs(
+        x = "Total Spending Ratio",
+        y = "Predicted Mortality Ratio"
+      ) +
+  geom_hline(yintercept = 1 , linetype="dashed", 
+               color = "orange" , size=0.75,na.rm=T)+
+    geom_vline(xintercept = 1 , linetype="dashed", 
+               color = "blue" , size=0.75,na.rm=T)+
+      annotate("point", y = 1,
+                      x = 1, 
+             size=4,colour = "blue")+
+      theme_bw() +
+      theme(legend.title = element_blank(),
+            legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic"),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+# Plot= plot_grid(p.inverse.smoothed,
+#               p.inverse.smoothed.scaled,
+#               labels = c("A", "B"),
+#               ncol=2,label_size = 20)
+print(p.inverse.smoothed.scaled) 
+#ggsave(here::here("NoteBooks/Tables_Plots/Figures","predict.Mort.on.Spending.png"),width = 7,heigh=5)
+#ggsave(here::here("NoteBooks/Tables_Plots/Figures","predict.Mort.on.Spending.svg"),width = 7,heigh=5)
+```
+It is critically important that the 1 on the x-axis refers to the 56.4 percentile in spending and the 1 on the y-axis refers to the mean predicted mortality rate. The plot says that those that spend 3 times more that the 56.4th percentile (i.e., close the the median) of their group (i.e., based on age and gender) will have a predicted mortality rate that is just under 10 times larger than the mean. 
+
+We will assume that we can apply the function shown in this plot to predict the mortality rate for any individual of any age and gender based on his/her spending. To see how this can be applied let's consider an example case. Consider a female aged 55 with health spending of \$X. We first find the predicted all cause morality rate of females aged 55 from the life tables, and then from the weighted MEPS we find the amount in dollars that corresponds to the 56.4 percentile of health spending for this group (i.e., females aged 55). We then find the ratio of \$X to this latter amount and use the plot to look-up the predicted mortality ratio. We finally multiply this ratio by the average mortality rate we found from the life tables.    
+
+
+
+## Table of average expenditures by age and gender
+
+To use the plot as a look-up we two things:
+
+1. A table that gives for each age and gender the all cause mortality rate given from the life tables and the amount representing the 56.4 percentile of health spending given from the weighted MEPS data. Note that the all cause mortality rate is used to represent the average predicted mortality rate, or equivalently the point where the predicted mortality ratio is equal to 1.
+2. A function describing the plot that gives the predicted mortality ratio as a function of the total spending ratio. 
+
+We can use the MEPS data to find the table. Example rows of this table is shown below. 
+```{r}
+avg.totexp.mortality.by.age.gender<-meps %>%
+  dplyr::select(age,gender,totexp,w) %>% 
+  dplyr::group_by(age,gender) %>% 
+  dplyr::summarise(totexp.at.reference.percentile=round(weighted.quantile(totexp,w,probs=totexp.at.mean.mx["spending.percentile"]/100 , na.rm = T),0)) %>% 
+  left_join(mx,by=c("age","gender")) %>% 
+  select(-year)
+print(head(avg.totexp.mortality.by.age.gender))
+print(tail(avg.totexp.mortality.by.age.gender))
+```
+
+## Function Specification 
+
+Next we need to defined a function. As we have been doing, this can be done using the R function *loess* which allows us to predict the mortality ratio as long as the input total spending ratio is given within the range shown in our plot. Predicting the mortality ratio for total spending ratios below and above our lower and upper bounds will require a smooth extrapolation. For now we assume that anyone with lower spending than that given in the plot will have the lowest allowed mortality ratio shown in the plot. Likewise, we make a similar assumption on the upper bound.  
+```{r}
+get.predicted.mx <- function(spending.ratio, model, range){
+  spending.ratio <- pmin(pmax(spending.ratio, range[1]), range[2])
+  R <- predict(model,spending.ratio)
+  return(R)
+}
+spending.ratio.range <- range(Einav1462.data.scaled$Health.Spending.ratio)
+inter.model.mx.ratio <- loess(Mortality.ratio~Health.Spending.ratio,data=Einav1462.data.scaled,span=0.3)
+
+inter.model.mx.ratio.Lower <- loess((Mortality.ratio*multi.Lower)~Health.Spending.ratio,data=Einav1462.data.scaled,span=0.3)
+inter.model.mx.ratio.Upper <- loess((Mortality.ratio*multi.Upper)~Health.Spending.ratio,data=Einav1462.data.scaled,span=0.3)
+```
+
+
+## Example Application
+
+Now, the simulation model will produce the dynamics of total expenditure for each agent in the model and it will keep track of various static and dynamic attributes including gender and age. Let's see an example of how the table above together with the function linking total spending ratio to mortality ratio would be used. In our example, let's assume that the MEPS data gives the status of our population in a given year. Then for each MEPS record and depending on the age and gender,  we find the ratio of the health spending to the total expenditure of the reference percentile. This is done by applying the table found above. Example output would look as follows.
+```{r echo=FALSE}
+pop<- meps %>%
+  select(age,gender,totexp,health.status,w)
+#%>%   mutate(health.status = c("poor","good")[as.numeric(health.status<3)+1])
+
+pop <- pop %>% 
+  left_join(avg.totexp.mortality.by.age.gender,by=c("age","gender")) %>% 
+  dplyr::mutate(spending.ratio = totexp/totexp.at.reference.percentile) %>% 
+  dplyr::mutate(totexp=round(totexp,0)) %>% 
+  dplyr::rename(avg.mx=mx)
+
+focus.set <- sample(nrow(pop),20)
+
+print(pop[focus.set,c("age","gender","totexp","totexp.at.reference.percentile","avg.mx","spending.ratio")])
+```
+Then, from the spending ratio we use the function above to find the predicted mortality ratio. 
+```{r echo=FALSE}
+pop$mx.ratio <- get.predicted.mx(pop$spending.ratio, model=inter.model.mx.ratio ,range=spending.ratio.range)
+pop$mx<- pmin(1,pop$mx.ratio*pop$avg.mx)
+print(pop[focus.set,c("age","gender","totexp","spending.ratio","mx.ratio","mx")])
+```
+
+## Ranges
+
+Uncertainty ranges can be obtained using the Lower and Upper models.
+
+```{r echo=FALSE}
+pop$mx.ratio <- get.predicted.mx(pop$spending.ratio, model=inter.model.mx.ratio.Lower ,range=spending.ratio.range)
+pop$mx<- pmin(1,pop$mx.ratio*pop$avg.mx)
+print(pop[focus.set,c("age","gender","totexp","spending.ratio","mx.ratio","mx")])
+
+pop$mx.ratio <- get.predicted.mx(pop$spending.ratio, model=inter.model.mx.ratio.Upper ,range=spending.ratio.range)
+pop$mx<- pmin(1,pop$mx.ratio*pop$avg.mx)
+print(pop[focus.set,c("age","gender","totexp","spending.ratio","mx.ratio","mx")])
+
+pop$mx.ratio <- get.predicted.mx(pop$spending.ratio, model=inter.model.mx.ratio ,range=spending.ratio.range)
+pop$mx<- pmin(1,pop$mx.ratio*pop$avg.mx)
+```
+
+
+## Correlation Verification 
+Interesting correlations:
+```{r}
+cor(pop$health.status,pop$totexp)
+cor(pop$health.status,pop$mx)
+cor(pop$mx,pop$totexp)
+```
+
+## Note about Pregnant Women
+
+As discused in our team meeting on August 1st, in the simulation model women who become pregnant will have higher spending costs. We want to avoid using this lookup table/function based on the higher spending of pregnancy. Therefore, for the purpose of find the mortality rate, for pregnant women we will compute their health spending as if they are not preganent and then use the lookup function. to find the mortality. 
+
+
+# Inflating the Spending in the last year of life
+
+As discussed in our meetings, those that eventually do die in the last year of life will have much larger health spending. Thus in the simulation model, once we calculate each individual's mortality rate we can stochastically determine whether or not they die that year. If they do die then we will correct for their spending in their last year. To carry out this correction we again turn to the study by @Einav1462. In panel B of their plot shown previously, they show that the total spending for the backfill decedents is \$30,000 in the last year of life if predicted morality rate at the beginning of the year was roughly below 0.125. If the predicted mortality rate was greater than 0.125 (and hence indicated very ill individuals), the total spending for the backfill decedents grows steeply. Again we use the automeris tool to extract data from this plot.    
+
+```{r echo=FALSE}
+Einav1462.data.file <- "../Mortality/Data/Einav1462_Backfill_Decedents.csv"
+Einav1462.BD<-read.csv(file.path(Einav1462.data.file),header = TRUE)
+#Einav1462.data<-rbind(Einav1462.data,c(0.95,100000))
+tmp <- predict(loess(Mortality~Health.Spending,data= Einav1462.BD,span=0.5))
+added.cases<-Einav1462.BD[Einav1462.BD$Mortality<min(tmp),]
+Einav1462.BD$Mortality <-tmp
+Einav1462.BD <- rbind(added.cases,Einav1462.BD)
+```
+
+```{r echo=FALSE}
+
+fp <- 3.2e4
+
+tmp<- Einav1462.BD %>% 
+   mutate(HS.tmp=Health.Spending-fp,lg.mort=log(Mortality,10), lg.lg.mort=-log(-lg.mort)) %>% 
+    filter(HS.tmp>0) 
+
+
+lillo<- lm(HS.tmp~lg.lg.mort,data=tmp)
+lillo.upper<- lillo
+lillo.lower<- lillo
+
+lillo.upper$coefficients["lg.lg.mort"]<- 3*lillo$coefficients["lg.lg.mort"]
+lillo.lower$coefficients["lg.lg.mort"]<- (2/3)*lillo$coefficients["lg.lg.mort"]
+
+tmp$Health.Spending.Upper  <- predict(lillo.upper,data=tmp)
+tmp$Health.Spending.Lower  <- predict(lillo.lower,data=tmp)
+
+tmp<- tmp %>% 
+  mutate(Health.Spending.Upper= pmax(Health.Spending, Health.Spending.Upper+min(Health.Spending)-min(Health.Spending.Upper)),
+         Health.Spending.Lower= pmin(Health.Spending,Health.Spending.Lower+min(Health.Spending)-min(Health.Spending.Lower))) %>% 
+  select(Mortality,Health.Spending,Health.Spending.Lower,Health.Spending.Upper)
+
+Einav1462.BD.range<- Einav1462.BD %>% 
+  mutate(Health.Spending.Upper=Health.Spending, Health.Spending.Lower=Health.Spending.Upper)
+
+Einav1462.BD.range <- rbind.data.frame(Einav1462.BD.range[Einav1462.BD.range$Health.Spending<=fp,],tmp)
+
+
+```
+
+
+```{r echo=FALSE}
+big <- 18
+small <- 12  
+p.smoothed= 
+      ggplot()+
+      geom_line(data = Einav1462.BD.range, aes(y = Health.Spending, x = Mortality), 
+                color = "darkorchid4", size = 1) +
+    geom_ribbon(data = Einav1462.BD.range,aes(ymin=Health.Spending.Lower, ymax=Health.Spending.Upper , x=Mortality), 
+              fill= "darkorchid3",alpha = 0.4) +
+            scale_x_log10(breaks = trans_breaks("log10", function(x) 10^x,n=3)(c(0.005,0.01,0.05,1)), limits=c(0.005,1)) + #labels = trans_format("log10", math_format(10^.x))
+  scale_y_continuous(limits=c(0,150000))+
+      labs(
+        y = "End-of-Life Spending ($US)",
+        x = "Predicted Mortality"
+      ) +
+      theme_bw() +
+      theme(legend.title = element_blank(),
+            legend.position=c(0.5, 0.70),
+            legend.background = element_rect(fill="transparent"),
+            panel.border = element_blank(),
+            axis.text.x=element_text(size=small,face="italic",angle = 45),
+            axis.text.y=element_text(size=small,face="italic" ) ,
+            strip.text=element_text( size=small,face="italic" ) ,
+            axis.title.x = element_text( size=big,face="italic" ) ,
+            axis.title.y = element_text( size=big,face="italic" ),
+            legend.text = element_text( size = small,face="italic")
+      )
+print(p.smoothed)
+#ggsave(here::here("NoteBooks/Tables_Plots/Figures","End.of.Life.Spending.png"),width = 7,heigh=5)
+#ggsave(here::here("NoteBooks/Tables_Plots/Figures","End.of.Life.Spending.svg"),width = 7,heigh=5)
+```
+
+As before, we create a look-up based model however this time we predict the total spending from the mortality rate of people that will die within the year.   
+```{r}
+inflate.spending.at.death<- function(mx, model, range){
+  mx<- pmin(pmax(mx,range[1]),range[2])
+  R<-  predict(model,mx)
+  return(R)
+}
+mx.range <- range(Einav1462.BD.range$Mortality)
+model.end.of.life.spending <- loess(Health.Spending~Mortality,data=Einav1462.BD.range)
+L.model.end.of.life.spending <- loess(Health.Spending.Lower~Mortality,data=Einav1462.BD.range)
+U.model.end.of.life.spending <- loess(Health.Spending.Upper~Mortality,data=Einav1462.BD.range)
+```
+
+In the simulation model, we use the mortality rates to select which individuals die within the current year. Those that are selected to die, will have their end of life year health spending inflated according to the Einev backfill decedents model. Thus, end of life total health spending will be predicted by this model if the prediction is greater than the total spending given by the year to year regression model. The table below shows a randomly selected set of individuals taken from our example population and predicts the *totexp.end.of.life*. Note that this value is equal to *totexp* if the prediction from the model is lower than the *totexp*. 
+```{r echo=FALSE}
+pop.die <- pop %>% 
+   mutate(die.this.year=as.logical(rbinom(nrow(.),1,mx))) %>% 
+  filter(die.this.year)
+
+
+totexp.end.of.life <- inflate.spending.at.death(pop.die$mx, model=model.end.of.life.spending,range=mx.range)
+pop.die$totexp.end.of.life <- pmax(pop.die$totexp,totexp.end.of.life)
+
+print(pop.die[sample(nrow(pop.die),10),c("die.this.year","age","gender","mx","totexp","totexp.end.of.life")])
+```
+
+Below we use the Lower and Upper uncertainty ranges in the estimates of the end of life total medical expenses. 
+
+```{r echo=FALSE}
+pop.die <- pop %>% 
+   mutate(die.this.year=as.logical(rbinom(nrow(.),1,mx))) %>% 
+  filter(die.this.year & mx>0.7)
+totexp.end.of.life <- inflate.spending.at.death(pop.die$mx, model=model.end.of.life.spending,range=mx.range)
+pop.die$totexp.end.of.life <- pmax(pop.die$totexp,totexp.end.of.life)
+totexp.end.of.life <- inflate.spending.at.death(pop.die$mx, model=L.model.end.of.life.spending,range=mx.range)
+pop.die$L.totexp.end.of.life <- pmax(pop.die$totexp,totexp.end.of.life)
+totexp.end.of.life <- inflate.spending.at.death(pop.die$mx, model=U.model.end.of.life.spending,range=mx.range)
+pop.die$U.totexp.end.of.life <- pmax(pop.die$totexp,totexp.end.of.life)
+
+print(pop.die[sample(nrow(pop.die),10),c("age","gender","totexp","totexp.end.of.life","L.totexp.end.of.life","U.totexp.end.of.life")])
+```
+
+
+
+# Health Status Dependence
+
+As shown previously, this appraches produces mortality rates that are reasonaly correlated to the health status. 
+```{r}
+cor(pop$health.status,pop$mx)
+```
+Nevertheless, perhaps we can do a little better and try to repeat this model with a more direct dependence of the mortality rate on health status. This would mean modeling the dynamics for health status. We certainly would like a very simple model which tracks the transitions between good and poor health status. The MEPS has a health status variable with levels between 1 to 5. However, based on our past work heath status 1 and 2 can be considerred as good health and health status 3,4 and 5 as poor health. There is little difference in heath between those within any one of these two groups. 
+
+
+Things we can rely on:
+
+1. Disability and Morbidity life tables^[See the plot on page 29 of the WHO Scientific Group on the Epidemiology of Aging & World Health Organization. (1984). The uses of epidemiology in the study of the elderly : report of a WHO Scientific Group on the Epidemiology of Aging [meeting held in Geneva from 11 to 17 January 1983]. World Health Organization. https://apps.who.int/iris/handle/10665/39136. This is also presented on page 17 https://books.google.com/books?id=jTTUBwAAQBAJ&printsec=frontcover&hl=it&source=gbs_ge_summary_r&cad=0#v=onepage&q&f=false]
+2. Health Costs^[https://www.healthcostinstitute.org/images/pdfs/Age-Curve-Study_0.pdf].
+3. Perhaps use life time risks of diabetes and cardivasular diseases by age as a proxy for health status^[see the plot in https://jamanetwork.com/journals/jama/fullarticle/197439 and Figure 1 https://www.ncbi.nlm.nih.gov/pmc/articles/PMC2748236/ also see https://www.livestories.com/statistics/us-diabetes-deaths-mortality which uses data available at https://wonder.cdc.gov/]. Also the tables of deaths by different causes^[https://www.cdc.gov/nchs/fastats/leading-causes-of-death.htm]
+
+```{r Adrienne}
+# For my purposes
+mx_table <- mx %>% 
+  dplyr::rename(Sex=gender,Age=age) %>% 
+  dplyr::select(-year) %>%
+  dplyr::mutate(Sex=as.factor(tolower(Sex)))
+
+avg.mort.table <- avg.totexp.mortality.by.age.gender %>%
+  dplyr::rename(Age=age) %>%
+  dplyr::mutate(Sex=as.factor(tolower(gender)))
+
+save(avg.mort.table, get.predicted.mx, spending.ratio.range, inter.model.mx.ratio, inter.model.mx.ratio.Lower, inter.model.mx.ratio.Upper, mx_table,file=here("NoteBooks/Integration/R_Objects/mx_table.RData"))
+save(mx.range, model.end.of.life.spending, file=here("NoteBooks/Integration/R_Objects/mx_cost.Rdata"))
+```

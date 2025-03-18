@@ -1,0 +1,873 @@
+---
+title: "Tables and Plots of the Dynamical Model"
+author:
+- name: 
+  affiliation: RAND Corporation
+date: "`r format(Sys.time(), '%B %d, %Y')`"
+output:
+  rmdformats::readthedown
+bibliography: ../../WriteUp/bibliography.bib
+pandoc_args: --natbib
+---
+
+# Introduction
+
+In this Notebook we load the simulation model output and produce tables and plots of interest that may be used in our final report     
+
+
+```{r include=FALSE}
+remove(list = ls())
+library(rmdformats)
+library(rmarkdown)
+library(here)
+library(openxlsx)
+library(measurements)
+library(spatstat)
+library(MortalityLaws)
+library(svglite)
+library(ggplot2)
+library(scales) 
+library(reshape2)
+library(cdlTools)
+library(tidyverse)
+library(cowplot)
+library(magick)
+library(stats)
+library(questionr)
+library(reldist)
+library(stargazer)
+library(knitr)
+library(DT)
+library(xtable)
+getwd()
+#setwd("/Users/rvardava/OneDrive - Rand Corporation/Temp_RAPP")
+
+add.title.row<- function(df, name="name"){
+  # function that adds row space braking up tables into a more readable format
+  x<- data.frame(t(rep(NA,ncol(df))))
+  colnames(x)<- colnames(df)
+  x[1] = name
+  
+  df<-bind_rows(x,df)
+  colnames(df)[1] <- "By" 
+  return(df)
+}
+
+small <- 10
+big <-2*small
+font.reduction.factor<- 1
+```
+
+# Load the Output data
+
+Here we load the output from our simulation model and add additional fields that we may want to consider. For example we can categorize Family Poverty Level (FPL), or categorize the people belonging to different percentiles of loans taken and forgiven. 
+
+```{r}
+run <- 2
+#dir.create(here::here("NoteBooks/Tables_Plots/Figures",run))
+file.name <- paste("Run",run,".rds",sep='')
+years<-readRDS(here("NoteBooks/FinalOutputs/",file.name))
+last.year <- length(years)-1
+```
+
+```{r}
+my.grey=rgb(120,115,114, max=255)
+my.blue=rgb(96,173,218, max=255)
+my.red=rgb(182,64,39, max=255)
+my.orange=rgb(246,135,31, max=255)
+my.purple=rgb(113,57,134, max=255)
+my.yellow=rgb(243,214,94, max=255)
+my.green=rgb(104,131,43, max=255)
+my.ltblue=rgb(152,184,225, max=255)
+my.ltpurp=rgb(182,162,194, max=255)
+my.darkyellow=rgb(238,180,73, max=255)
+my.pink=rgb(243,127,141, max=255)
+my.lime=rgb(157,185,75, max=255)
+my.darkblue=rgb(67,116,162, max=255)
+
+
+```
+
+# Create Useful Derived data-sets
+
+
+# Tables
+
+We start using the data-frame representing the population in the final year of our dynamics.
+```{r include=FALSE}
+dat <- years[[last.year]]
+
+dat <- dat %>% 
+  mutate(FPL.cat =cut(FPL,c(0,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+
+
+```
+
+## Tables on Medical Spending
+
+Here we show the number of individuals of those who needed to take a Loan broken by age group, health status and FPL. 
+```{r star, results = 'asis', warning=FALSE, message=FALSE}
+tab1<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,HS,FPL.cat) %>%  
+  summarise(N = round(sum(WT),0)) %>% 
+  spread(key= "HS", value="N")
+#stargazer(tab1,type = 'html',summary=F)
+kable(tab1)
+```
+
+The table below focuses on the final year and shows the medical spending statistics (including, number of people, number of records, mean medical spending and various percentiles of medical spending) for all individuals who took up a loan. 
+```{r}
+tab2<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec = sum(0*WT+1),
+            totexp.mean= weighted.mean(MedSpend, WT,na.rm = T),
+            totexp.q5 = Hmisc::wtd.quantile(MedSpend,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            totexp.q25 = Hmisc::wtd.quantile(MedSpend,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            totexp.q50 = Hmisc::wtd.quantile(MedSpend,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            totexp.q75 = Hmisc::wtd.quantile(MedSpend,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            totexp.q95 = Hmisc::wtd.quantile(MedSpend,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tab2)
+```
+## Tables on total Loans
+The table below focuses on the final year and shows the total loan statistics for all individuals who took up a loan.
+
+```{r}
+gender.loans.tot<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(Sex) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0) %>% mutate_if(is.factor, as.character)
+gender.loans.tot<- add.title.row(gender.loans.tot,"Sex")
+
+race.loans.tot<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(Race) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec = n(),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0) %>% mutate_if(is.factor, as.character)
+race.loans.tot<- add.title.row(race.loans.tot,"Race")
+
+age.loans.tot<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)%>% mutate_if(is.factor, as.character)
+age.loans.tot<- add.title.row(age.loans.tot,"AgeGroup")
+
+FPL.loans.tot<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(FPL.cat) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)%>% mutate_if(is.factor, as.character)
+FPL.loans.tot<- add.title.row(FPL.loans.tot,"FPL")
+
+tab.loans.tot<- bind_rows(gender.loans.tot,race.loans.tot,age.loans.tot,FPL.loans.tot)
+kable(tab.loans.tot)
+```
+
+```{r}
+tab.loans.tot<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec = sum(0*WT+1),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tab.loans.tot)
+```
+
+## Pregnancy Tables
+
+Let's ask out of plan eligible females who become pregnant during the years of the dynamics that survived to the final year, how many needed a loan, what percentage, by FPL. How many have loans forgiven and what percentage of the loan is forgiven?
+
+```{r}
+dat.final <- years[[last.year]] %>% 
+  mutate(n.pregnancies = 0)
+dat.final <- dat.final %>% 
+  mutate(FPL.cat =cut(FPL,c(-Inf,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat.final$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+
+ticks<- c(1:last.year)
+for (i in ticks){
+  dat <- years[[i]]
+  preg.id <- dat %>% filter(Preg%in%"pregnant",id%in%dat.final$id) %>% select(id)
+  dat.final$n.pregnancies[match(preg.id$id,dat.final$id)] <- dat.final$n.pregnancies[match(preg.id$id,dat.final$id)]+1 
+}
+
+
+tab.preg.elig<-dat.final %>% 
+  filter(n.pregnancies>0) %>% 
+  group_by(FPL.cat) %>% 
+  summarise(Nrec = n(),
+            N = sum(WT),
+            N.elig=sum(WT*(Elig>0)),
+            N.used=sum(WT*(Ever.Borrowed>0)),
+            N.forgiven = sum(WT*(Ever.Forgiven>0)),
+            Perc.eligible = 100*sum(WT*(Elig>0))/sum(WT),
+            Perc.used.plan = 100*sum(WT*(Ever.Borrowed>0))/sum(WT*(Elig>0)),
+            Perc.used.plan.all = 100*sum(WT*(Ever.Borrowed>0))/sum(WT),
+            Perc.used.loan.forg = 100*sum(WT*(Ever.Forgiven>0))/sum(WT*(Ever.Borrowed>0))) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tab.preg.elig)
+```
+
+# Deaths
+
+For each year, the simulation model keeps only the individuals that haven't died and are below age 85. This means that if we just load the last year of data our analysis will include just those who survive, are younger than 85 and the new born. We would thus exclude a bunch of records which could be revealing about the dynamics. Hence here we create a look-up table linking each removed record to the last year they were present. We can then use the look-up table to find any subset of these records which we may want to include in various analyses.
+
+```{r}
+ticks<- c(1:last.year)
+deaths<-NULL
+for (i in ticks){
+  dat <- years[[i]] %>% 
+    filter(Survive==0 & Age<65) %>% 
+    mutate(year.of.removal=i) 
+  deaths<- rbind.data.frame(deaths,dat)
+}
+deaths <- deaths %>% 
+  mutate(FPL.cat =cut(FPL,c(-Inf,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(deaths$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+```
+
+```{r}
+ ggplot(deaths) +
+    geom_histogram(boundary = 0, 
+                   aes(x=Age,y=..count../sum(..count..),weight = WT),
+                   alpha=0.7,binwidth = 1, position = "identity")+
+    scale_y_continuous(labels = scales::percent)+
+    #geom_density(aes(x=c1, y = 0.3*..count../sum(..count..)),alpha=0.7, fill="pink",color="red",size=0.1) +
+    #geom_density(aes(x=c1.tilde, y = 2*..count..),alpha=0.7, fill="lightblue",color="blue",size=0.1)+
+    theme_bw() +
+    scale_fill_manual(name="group",values=c("red","steelblue3"))+
+    scale_color_manual(name="group",values=c("red","steelblue3"))+
+    xlab("Age") +
+    ylab("Normalized weight") + 
+    theme(panel.border = element_blank(),
+               legend.title = element_blank(),
+               #legend.position = c(0.80,0.80),
+               legend.background = element_rect(fill="transparent"),
+               axis.text.x=element_text(size=small,face="italic"), 
+               axis.text.y=element_text(size=small,face="italic" ) ,
+               strip.text=element_text( size=small,face="italic" ) ,
+               axis.title.x = element_text( size=big,face="italic" ) ,
+               axis.title.y = element_text( size=big,face="italic" ),
+               legend.text = element_text( size = big,face="italic"))
+```
+
+```{r}
+tab.deaths<-deaths %>% 
+  group_by(FPL.cat) %>% 
+  summarise( Nrec = n(),
+             N = sum(WT),
+             N.elig = sum(WT*(Elig>0)),
+            N.used=sum(WT*(Ever.Borrowed>0)),
+            N.forgiven = sum(WT*(Ever.Forgiven>0)),
+            Perc.eligible = 100*sum(WT*(Elig>0))/sum(WT),
+            Perc.used.plan = 100*sum(WT*(Ever.Borrowed>0))/sum(WT*(Elig>0)),
+            Perc.used.plan.all = 100*sum(WT*(Ever.Borrowed>0))/sum(WT),
+            Perc.loan.forg = 100*sum(WT*(Ever.Forgiven>0))/sum(WT*(Ever.Borrowed>0))) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tab.deaths)
+```
+
+
+# Plot Interesting Trajectories
+
+Let's find the id of the individuals that in the last year of the dynamics had their total loan closest to the mean value of their group. Hence, their total loan is the most representative of that group.
+```{r}
+tab2.reduced <- tab.loans.tot %>% select(AgeGroup,HS,loan.mean)
+traj.interest<-dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  select(id, AgeGroup,HS,Loans.totalthisyear) %>% 
+  group_by(AgeGroup,HS)  %>% 
+  left_join(.,tab2.reduced,by=c("AgeGroup","HS")) %>% 
+  mutate(abs.diff=abs(Loans.totalthisyear - loan.mean)) %>% 
+  filter(abs.diff == min(abs.diff))%>% 
+  mutate_if(is.numeric, round, 0)
+print(traj.interest)
+```
+
+Let's now extract the trajectories of the total Loans for these representative individuals
+```{r}
+focuse.measure <- "Loans.totalthisyear"  
+collect.traj <- traj.interest$id
+for(i in 1:last.year){
+  tmp<-years[[i]] 
+  tmp<- tmp[match(traj.interest$id,tmp$id),focuse.measure]
+  collect.traj <- cbind.data.frame(collect.traj,tmp)
+}
+colnames(collect.traj)<- c("id",paste("Loans.totalthisyear","year",1:last.year,sep="_")) 
+
+#collect.traj<- left_join(traj.interest,collect.traj,by="id")
+```
+
+Let's rearrange the data from a wide to a long format and plot it with ggplot. The plots are saved using both a png and an svg format. 
+```{r}
+colnames(collect.traj)[-1]<- c(1:last.year)
+long.traj <- collect.traj %>%  
+  gather("year", "Loans.totalthisyear",-id) %>% 
+  left_join(traj.interest[,1:3],by="id") %>% 
+  mutate(lab=paste(AgeGroup,HS,sep=" ")) %>% 
+  select(-AgeGroup,-HS)
+long.traj$year <- as.numeric(long.traj$year)
+```
+
+
+```{r}
+ plot.long.traj<- ggplot(long.traj) +
+    geom_line(aes(x=year, y=Loans.totalthisyear, group=  lab, colour =  lab),size=1.5) +
+    #facet_wrap(~ tax.ids, nrow = 2)+
+    xlab("Year") +
+    ylab("Balance Total ($)") + 
+    theme_bw() +
+  theme(panel.border = element_blank(),
+        legend.title = element_blank(),
+        #legend.position = c(0.80,0.80),
+        legend.background = element_rect(fill="transparent"),
+        axis.text.x=element_text(size=small,face="italic"), 
+        axis.text.y=element_text(size=small,face="italic" ) ,
+        strip.text=element_text( size=small,face="italic" ) ,
+        axis.title.x = element_text( size=big,face="italic" ) ,
+        axis.title.y = element_text( size=big,face="italic" ),
+        legend.text = element_text( size = big,face="italic"))
+ print( plot.long.traj)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("Loan.traj.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("Loan.traj.",run,".svg",sep="")),width = 7,heigh=5)
+```
+
+Note, these represent true trajectories of individuals in our simulation based on which group they end up in at the final year of the dynamics. However, another plot could show how the Loan statistics for people belonging to each group changes from year to year. This is different because from year to year individuals may transition in and out of a given group. All we are interested here is the dynamics of the population statistics found from year to year.  
+
+The first set is to gather the statistics of the total Loans for each year.
+```{r}
+ticks<- c(1:last.year)
+gather.stats.over.years<-NULL
+for (i in ticks){
+  dat <- years[[i]]
+  tab.loans.tot<- dat %>% 
+     filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec = sum(0*WT+1),
+            loan.mean= weighted.mean(Loans.totalthisyear, WT,na.rm = T),
+            loan.q5 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q25 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q40 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.40),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q50 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q60 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.60),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q75 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            loan.q95 = Hmisc::wtd.quantile(Loans.totalthisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0) %>% 
+    mutate(lab=paste(AgeGroup,HS,sep=" ")) %>% 
+    mutate(year=i)
+  
+  gather.stats.over.years<- rbind.data.frame(gather.stats.over.years,tab.loans.tot)
+}
+gather.stats.over.years<-as.data.frame(gather.stats.over.years)
+gather.stats.over.years<-gather.stats.over.years[!is.na(gather.stats.over.years[,"AgeGroup"]),]
+```
+
+
+```{r}
+
+ plot.long.traj<- 
+   ggplot(gather.stats.over.years) +
+    geom_line(aes(x=year, y=loan.q50, group=  lab, colour =  lab),size=1) +
+   geom_ribbon(aes(x=year,ymin = loan.q25, ymax = loan.q75,fill =  lab), alpha=0.2) +
+    #facet_wrap(~ tax.ids, nrow = 2)+
+    xlab("Year") +
+    ylab("Balance Total ($)") + 
+    theme_bw() +
+  theme(panel.border = element_blank(),
+        legend.title = element_blank(),
+        #legend.position = c(0.80,0.80),
+        legend.background = element_rect(fill="transparent"),
+        axis.text.x=element_text(size=small,face="italic"), 
+        axis.text.y=element_text(size=small,face="italic" ) ,
+        strip.text=element_text( size=small,face="italic" ) ,
+        axis.title.x = element_text( size=big,face="italic" ) ,
+        axis.title.y = element_text( size=big,face="italic" ),
+        legend.text = element_text( size = big,face="italic"))
+ print( plot.long.traj)
+ ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("Loan.stat.traj.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("Loan.stat.traj.",run,".svg",sep="")),width = 7,heigh=5)
+```
+
+```{r}
+dat <- years[[last.year]]
+
+dat <- dat %>% 
+  mutate(FPL.cat =cut(100*FPL,c(0,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+
+z<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,Race) %>% 
+  summarise(N = round(sum(WT)/1e6,2))
+
+z.all<- dat %>%   
+  filter(AgeGroup!="65+") %>% 
+  group_by(AgeGroup,Race) %>% 
+  summarise(N = round(sum(WT)/1e6,2))
+
+plot.bar.ageg.race <-  
+  ggplot(z)+
+  geom_bar(aes(AgeGroup,weight = N,
+               fill=Race))+
+  geom_text(aes(x=AgeGroup,y=N,label=round(N,1), group=Race),
+            size = 3, 
+            position = position_stack(vjust = 0.5,reverse = F))+
+ #coord_flip() +
+    ylab("N (millions)") +
+    xlab("Age Group")+
+    scale_fill_manual(values = c(my.ltpurp,my.ltblue,my.lime,my.red))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.25),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic"), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+
+print(plot.bar.ageg.race)
+ ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("bar.ageg.race.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("bar.ageg.race.",run,".svg",sep="")),width = 7,heigh=5)
+```
+
+
+
+```{r}
+dat <- years[[last.year]]
+dat$FPL <- pmax(0,dat$FPL)
+dat <- dat %>% 
+  mutate(FPL.cat =cut(FPL,c(0,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+
+z<- dat %>%   
+  filter(Loans.totalthisyear>0) %>% 
+  group_by(AgeGroup,FPL.cat) %>% 
+  summarise(N = round(sum(WT)/1e6,2))
+
+if(!all(is.na(z$AgeGroup))){
+plot.bar.ageg.fpl <-  
+  ggplot(z)+
+  geom_bar(aes(FPL.cat,weight =N,
+               fill=AgeGroup),
+           position = position_dodge2(preserve = "single"))+
+ #coord_flip() +
+    ylab("N (millions)") +
+    xlab("FPL")+
+    scale_fill_manual(values = c(my.blue,my.pink,my.lime,my.purple))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.35),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic",angle = 30, hjust = 1), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+
+print(plot.bar.ageg.fpl)
+ ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("bar.ageg.fpl.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("bar.ageg.fpl.",run,".svg",sep="")),width = 7,heigh=5)
+}
+```
+
+
+```{r}
+dat <- years[[last.year]] %>% 
+  filter(Age<65, Loans.totalthisyear>0)
+
+plot.box.ageg <-  
+  ggplot(dat)+
+  geom_boxplot(aes(x=AgeGroup,y=Loans.totalthisyear, weight =WT,fill=AgeGroup))+
+       scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x,n=4))+#,labels = trans_format("log10", math_format(10^.x))) + #labels = trans_format("log10", math_format(10^.x))
+ #coord_flip() +
+    ylab("Deferred Payment Balance ($)") +
+    xlab("AgeGroup")+
+    scale_fill_manual(values = c(my.blue,my.lime,my.pink,my.yellow))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.25),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic"), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+
+print(plot.box.ageg)
+ ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("box.ageg.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("box.ageg.",run,".svg",sep="")),width = 7,heigh=5)
+
+
+dat <- years[[last.year]]
+dat$FPL <- pmax(0,dat$FPL)
+dat <- dat %>% 
+  mutate(FPL.cat =cut(FPL,c(0,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+
+plot.box.fpl <-  
+  ggplot(dat)+
+  geom_boxplot(aes(x=FPL.cat,y=Loans.totalthisyear, weight =WT,fill=FPL.cat)) +
+       scale_y_log10(breaks = trans_breaks("log10", function(x) 10^x,n=4))+#,labels = trans_format("log10", math_format(10^.x))) + #labels = trans_format("log10", math_format(10^.x))
+ #coord_flip() +
+    ylab("Deferred Payment Balance ($)") +
+    xlab("FPL")+
+    scale_fill_manual(values = c(my.blue,my.lime,my.darkblue,my.pink,my.yellow,my.red,my.purple))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.25),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic"), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+
+print(plot.box.fpl)
+ ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("box.fpl.",run,".png",sep="")),width = 7,heigh=5)
+ggsave(here::here("NoteBooks/Tables_Plots/Figures",paste("box.fpl.",run,".svg",sep="")),width = 7,heigh=5)
+```
+
+
+
+
+# Government Output
+
+Here we want to track how much debt was forgiven over time and see who was the most expensive categories in the 10plan to government. Note we will need to collect the amount fogiven for all those currently alive as well as the amounts forgiven to those that have died.
+
+```{r echo=FALSE}
+ticks<- c(1:last.year)
+removed.ids.lookup<-NULL
+for (i in ticks){
+  dat <- years[[i]] %>%
+    filter(Survive==0 | Age==85) %>%
+    mutate(year.of.removal=i) %>%
+    select(id,Age,WT,year.of.removal)
+  removed.ids.lookup<- rbind.data.frame(removed.ids.lookup,dat)
+}
+
+# take current alive population
+dat <- years[[last.year]]
+dat$year.of.removal<-NA
+
+# append the removed population
+for (y in 1:(last.year-1)){
+  tmp <- years[[y]]
+  tmp <- tmp[tmp$id %in%  removed.ids.lookup$id[removed.ids.lookup$year.of.removal==y],]  
+  tmp$year.of.removal<-y
+  dat <- rbind(dat,tmp)
+}
+dat <- dat %>% 
+  mutate(FPL.cat =cut(FPL,c(-Inf,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("Below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","Above 800%")
+```
+
+Dollar amount forgiven in 15 years ofthe plan in trillion sof dollars. 
+```{r}
+tab.forgiven.tot<- dat %>%   
+  filter(Ever.Forgiven>0) %>% 
+  summarise(      Nrec = n(),
+                  N = round(sum(WT),2),
+            Forgiven.tot = sum(WT)*weighted.mean(Ever.Forgiven, WT,na.rm = T)/1e9,
+            Forgiven.yeartot = sum(WT)*weighted.mean(Forgiven.thisyear, WT,na.rm = T)/1e9,
+            Forgiven.26 = sum(WT)*weighted.mean(Forgiven.26, WT,na.rm = T)/1e9, 
+            Forgiven.65 = sum(WT)*weighted.mean(Forgiven.65, WT,na.rm = T)/1e9, 
+            Forgiven.death = sum(WT)*weighted.mean(Forgiven.death, WT,na.rm = T)/1e9, 
+            Forgiven.expire = sum(WT)*weighted.mean(Forgiven.expire, WT,na.rm = T)/1e9) %>% 
+  mutate_if(is.numeric, round, 3)
+kable(tab.forgiven.tot)
+```
+
+
+
+```{r}
+tab.forgiven.tot<- dat %>%   
+  filter(Ever.Forgiven>0) %>% 
+  group_by(FPL.cat) %>% 
+  summarise(      Nrec = n(),
+                  N = round(sum(WT),2),
+            Forgiven.tot = sum(WT)*weighted.mean(Ever.Forgiven, WT,na.rm = T)/1e9,
+            Forgiven.yeartot = sum(WT)*weighted.mean(Forgiven.thisyear, WT,na.rm = T)/1e9,
+            Forgiven.26 = sum(WT)*weighted.mean(Forgiven.26, WT,na.rm = T)/1e9, 
+            Forgiven.65 = sum(WT)*weighted.mean(Forgiven.65, WT,na.rm = T)/1e9, 
+            Forgiven.death = sum(WT)*weighted.mean(Forgiven.death, WT,na.rm = T)/1e9, 
+            Forgiven.expire = sum(WT)*weighted.mean(Forgiven.expire, WT,na.rm = T)/1e9)  %>% 
+  mutate_if(is.numeric, round, 3)
+kable(tab.forgiven.tot)
+```
+```{r}
+tab.forgiven.tot<- dat %>%   
+  filter(Ever.Forgiven>0) %>% 
+  group_by(AgeGroup,HS) %>% 
+  summarise(      Nrec = n(),
+                  N = round(sum(WT),2),
+            Forgiven.tot = sum(WT)*weighted.mean(Ever.Forgiven, WT,na.rm = T)/1e9,
+            Forgiven.yeartot = sum(WT)*weighted.mean(Forgiven.thisyear, WT,na.rm = T)/1e9,
+            Forgiven.26 = sum(WT)*weighted.mean(Forgiven.26, WT,na.rm = T)/1e9, 
+            Forgiven.65 = sum(WT)*weighted.mean(Forgiven.65, WT,na.rm = T)/1e9, 
+            Forgiven.death = sum(WT)*weighted.mean(Forgiven.death, WT,na.rm = T)/1e9, 
+            Forgiven.expire = sum(WT)*weighted.mean(Forgiven.expire, WT,na.rm = T)/1e9)  %>% 
+  mutate_if(is.numeric, round, 3)
+kable(tab.forgiven.tot)
+```
+
+
+
+```{r}
+for.tot<- NULL
+for (y in 1:(last.year)){
+  tmp <- years[[y]]
+  tmp <- c(year=y,Forgiven.tot=sum(tmp$WT*tmp$Forgiven.thisyear),
+               Forgiven.26=sum(tmp$WT*tmp$Forgiven.26),
+               Forgiven.65=sum(tmp$WT*tmp$Forgiven.65),
+               Forgiven.death=sum(tmp$WT*tmp$Forgiven.death),
+               Forgiven.expire=sum(tmp$WT*tmp$Forgiven.expire))
+ for.tot<- rbind(for.tot,tmp)
+}
+for.tot<- as.data.frame(for.tot)
+print(for.tot)
+```
+
+
+```{r}
+sum(tab.forgiven.tot$Forgiven.total)/1e9
+sum(for.tot$Forgiven.tot)/1e9
+```
+
+Ask Adrienne why these two totals do not match.
+
+
+
+# Tables and Plots by health status
+
+## Repayment premium
+
+Statistics of the Repayment.thisyear (i.e., Repayment premium) by health status and age group. The first table below gives the statistics of the Repayment premium for those who have borrowed and have a non-zero Repayment premium. The second table is for those with an outstanding balance to pay but were not able to pay any of their repayment premium.  
+
+
+```{r echo=FALSE}
+dat <- years[[last.year]]
+
+dat <- dat %>% 
+  mutate(FPL.cat =cut(FPL,c(0,100,150,250,400,600,800,Inf),include.lowest = T, right = F))
+levels(dat$FPL.cat) <- c("below 100%","100-150%","150-250%","250-400%","400-600%","600-800%","above 800%")
+```
+
+```{r echo=FALSE}
+tmp1<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear>0) %>%  
+  group_by(AgeGroup, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            mean= weighted.mean(Repayment.thisyear, WT,na.rm = T),
+            q5 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            q25 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            q50 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            q75 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            q95 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp1)
+```
+
+```{r echo=FALSE}
+  ggplot(tmp1)+
+  geom_bar(aes(AgeGroup,weight =mean,
+               fill=HS),
+           position = position_dodge2(preserve = "single"))+
+ #coord_flip() +
+    ylab(" Repayment.thisyear (dollars)") +
+    xlab("AgeGroup") +
+    scale_fill_manual(values = c(my.pink,my.lime))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.35),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic",angle = 30, hjust = 1), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+```
+
+```{r echo=FALSE}
+tmp2<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear==0) %>%  
+  group_by(AgeGroup, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n()) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp2)
+```
+
+
+The tables below provide similar statistics but break-down the population based on FPL category instead of age group. 
+```{r echo=FALSE, warning=FALSE}
+tmp1<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear>0) %>%  
+  group_by( FPL.cat, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            mean= weighted.mean(Repayment.thisyear, WT,na.rm = T),
+            q5 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            q25 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            q50 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            q75 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            q95 = Hmisc::wtd.quantile(Repayment.thisyear,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp1)
+```
+```{r echo=FALSE}
+  ggplot(tmp1)+
+  geom_bar(aes(FPL.cat,weight =mean,
+               fill=HS),
+           position = position_dodge2(preserve = "single"))+
+ #coord_flip() +
+    ylab(" Repayment.thisyear (dollars)") +
+    xlab("FPL.cat") +
+    scale_fill_manual(values = c(my.pink,my.lime))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.35),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic",angle = 30, hjust = 1), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+```
+
+
+```{r echo=FALSE}
+tmp2<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear==0) %>%  
+  group_by( FPL.cat, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n())%>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp2)
+```
+
+## out-of-pocket
+
+The tables below focus on the copays or equivalently, the out-of-pocket expenses those with an outstanding balance and that respectively have non zero and zero repayment premiums paid in the last year.
+
+```{r echo=FALSE}
+tmp1<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear>0) %>%  
+  group_by(AgeGroup, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+            mean= weighted.mean(OOP, WT,na.rm = T),
+            q5 = Hmisc::wtd.quantile(OOP,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            q25 = Hmisc::wtd.quantile(OOP,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            q50 = Hmisc::wtd.quantile(OOP,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            q75 = Hmisc::wtd.quantile(OOP,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            q95 = Hmisc::wtd.quantile(OOP,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE)) %>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp1)
+```
+
+```{r echo=FALSE}
+  ggplot(tmp1)+
+  geom_bar(aes(AgeGroup,weight =mean,
+               fill=HS),
+           position = position_dodge2(preserve = "single"))+
+ #coord_flip() +
+    ylab("Out-of-Pocket (dollars)") +
+    xlab("AgeGroup") +
+    scale_fill_manual(values = c(my.pink,my.lime))+ #"#78429E","#4F81BD"
+    theme(legend.title = element_blank(),
+          legend.position=c(0.5,-0.35),
+          plot.margin=unit(c(1,1,1.5,1),"cm"),
+          legend.direction="horizontal",
+          legend.background = element_rect(fill="transparent"),
+          panel.border = element_blank(),
+          axis.text.x=element_text(size=small,face="italic",angle = 30, hjust = 1), 
+          axis.text.y=element_text(size=small,face="italic" ) ,
+          strip.text=element_text( size=small,face="italic" ) ,
+          axis.title.x = element_text( size=big,face="italic" ) ,
+          axis.title.y = element_text( size=big ,face="italic"),
+          legend.text = element_text( size = small,face="italic"))
+```
+
+```{r echo=FALSE}
+tmp2<- dat %>% 
+  select(Sex,AgeGroup,Race,HS, FPL.cat, Borrow, OOP,Repayment.thisyear, Elig, WT) %>% 
+  filter(Elig==1, Borrow>0, Repayment.thisyear==0) %>%  
+  group_by(AgeGroup, HS) %>% 
+  summarise(N = round(sum(WT),2),
+            Nrec =  n(),
+             mean= weighted.mean(OOP, WT,na.rm = T),
+            q5 = Hmisc::wtd.quantile(OOP,probs=c(0.05),na.rm=T,weight=WT,normwt= TRUE),
+            q25 = Hmisc::wtd.quantile(OOP,probs=c(0.25),na.rm=T,weight=WT,normwt= TRUE),
+            q50 = Hmisc::wtd.quantile(OOP,probs=c(0.5),na.rm=T,weight=WT,normwt= TRUE),
+            q75 = Hmisc::wtd.quantile(OOP,probs=c(0.75),na.rm=T,weight=WT,normwt= TRUE),
+            q95 = Hmisc::wtd.quantile(OOP,probs=c(0.95),na.rm=T,weight=WT,normwt= TRUE))%>% 
+  mutate_if(is.numeric, round, 0)
+kable(tmp2)
+```
+

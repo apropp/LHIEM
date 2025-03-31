@@ -12,6 +12,18 @@ LHIEM was designed to assess a health care financing proposal that would allow i
 
 ## Usage
 
-To run the model, navigate to LHIEM/Integration/10Plan_RunFile.R and run the program. The file `InputOutputFile.xlsx` contains the parameters used for the main experiments described in the paper. `10Plan_RunFile.R` loads this file, then executes `10Plan_Integrated_loanextracted.R` with the relevant specifications. The file `10Plan_Integrated_loanextracted.R` contains the main mechanics of the model, including the application of the proposed policy. The policy analysis is applied in a modular fashion (separate from the rest of the core model mechanics) to allow for easy modification of the policy analysis piece.
+To run the model, navigate to `LHIEM/Integration/10Plan_RunFile.R` and run the program. The file `InputOutputFile.xlsx` contains the parameters used for the main experiments described in the paper. `10Plan_RunFile.R` loads this file, then executes `10Plan_Integrated_loanextracted.R` with the relevant specifications. The file `10Plan_Integrated_loanextracted.R` contains the main mechanics of the model, including the application of the proposed policy. The policy analysis is applied in a modular fashion (separate from the rest of the core model mechanics) to allow for easy modification of the policy analysis piece.
 
 The file `10Plan_RunFile_COVID.R` is a version of the model that was adapted to analyze the 10Plan policy under COVID conditions.
+
+The folder `LHIEM/Integration/FunctionScripts/` contains all of the functions written for the model, organized by submodel. This is intended to streamline adaptation for other policy questions. For three of these (fertility, health status, and mortality), there are tutorial notebooks that walk through the overall logic of these submodels. These can be found at `LHIEM/Fertility/Modeling Brirths.Rmd`, `LHIEM/Health Status/Predicting The Dynamics of Health Status-v3.Rmd`, and `LHIEM/Mortality/Predicting_Mortality_from_Health_Spending.Rmd`, respectively.
+
+## Tutorials
+
+To provide deeper insight into some of the submodels' logic, we provide three R notebooks that can be used as tutorials. The R notebooks can be found at:
+
+*`LHIEM/Fertility/Modeling Brirths.Rmd`
+*`LHIEM/Health Status/Predicting The Dynamics of Health Status-v3.Rmd`
+*`LHIEM/Mortality/Predicting_Mortality_from_Health_Spending.Rmd`
+
+They can be viewed as HTML files or as interactive R markdown files.

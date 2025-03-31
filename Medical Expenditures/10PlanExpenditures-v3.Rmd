@@ -1,0 +1,1009 @@
+---
+title: "10Plan Expenditures"
+author: "Adrienne propp"
+date: "7/23/2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Intro
+
+In this script we attempt to model medical expenditures in year 2, based on medical expenditures in year 1 and demographic characteristics. The general idea is to build a classification and regression tree, or CART, to identify meaningful partitions. We then build a regression for each partition to predict spending.
+
+Our intention is to be able to predict the healthcare expenditures of 10Plan participants. Predicting the healthcare expenditures of the rest of the population is out of scope.
+
+We use the `rpart` package to build our CART model.
+
+```{r Packages}
+remove(list = ls())
+library(rpart)
+library(rpart.plot)
+library(rpart.utils)
+library(caret)
+library(foreign)
+library(ROCR)
+library(pROC)
+library(rcompanion)
+require(aod)
+require(MASS)
+library(tidyselect)
+library(treeClust)
+library(lmtest)
+library(dplyr)
+
+path <- getwd()
+adjusted <- FALSE
+```
+
+## Data
+
+We use the MEPS 2015-2016 longitudinal data file (h193 online). This data was taken over 5 rounds. More information about the panel design and data collection process can be found at https://meps.ahrq.gov/survey_comp/hc_data_collection.jsp.
+
+If downloading the data for the first time, execute the code below, saving to the appropriate directory.
+
+```{r MEPS}
+download.file("https://meps.ahrq.gov/mepsweb/data_files/pufs/h193ssp.zip", temp <- tempfile())
+unzipped_file = unzip(temp)
+h193 <- read.xport(unzipped_file)
+unlink(temp)
+save(h193, file=file.path(path,"h193.Rdata"))
+```
+
+Otherwise, skip that script and just load the data, as below.
+
+```{r MEPS2}
+load(file.path(path,'../../Data/h193.Rdata'))
+#load(file.path(path,'../../Data/h171.Rdata')) # We use this to check 3rd year effects
+```
+
+
+We also need to load event-level files. This allows us to analyze the proportion of spending by type, and the average expenditure per prescription medicine (the cheaper of either a $25 copay or the full cost of the medicine will be paid by the enrollee, out of pocket).
+```{r MEPS3}
+load(file.path(path,'../../Data/h188a.Rdata'))
+load(file.path(path,'../../Data/h188b.Rdata'))
+load(file.path(path,'../../Data/h188c.Rdata'))
+load(file.path(path,'../../Data/h188d.Rdata'))
+load(file.path(path,'../../Data/h188e.Rdata'))
+load(file.path(path,'../../Data/h188f.Rdata'))
+load(file.path(path,'../../Data/h188g.Rdata'))
+load(file.path(path,'../../Data/h188h.Rdata'))
+
+# Pregnancy-related costs noted in variable "RSNINHOS" in file D
+# D: IPXP16X - code 6 - Hospital inpatient
+
+# Pregnancy-related costs noted in variable "VSTCTGRY" in files E, F, G
+# E: ERXP16X - code 6 - ER
+# F: OPXP16X - code 8 - Outpatient
+# G: OBXP16X - code 8 - Office-based
+
+# Extract pregnancy-related expenditures for individuals from all files
+d.preg = dplyr::select(subset(h188d,h188d$RSNINHOS==6 | h188d$RSNINHOS==4), DUPERSID, IPXP16X); colnames(d.preg)[colnames(d.preg)=="IPXP16X"] <- "EXP"
+e.preg = dplyr::select(subset(h188e,h188e$VSTCTGRY==6), DUPERSID, ERXP16X); colnames(e.preg)[colnames(e.preg)=="ERXP16X"] <- "EXP"
+f.preg = dplyr::select(subset(h188f,h188f$VSTCTGRY==8), DUPERSID, OPXP16X); colnames(f.preg)[colnames(f.preg)=="OPXP16X"] <- "EXP"
+g.preg = dplyr::select(subset(h188g,h188g$VSTCTGRY==8), DUPERSID, OBXP16X); colnames(g.preg)[colnames(g.preg)=="OBXP16X"] <- "EXP"
+
+all.costs <- rbind(d.preg, e.preg, f.preg, g.preg) # Put them all together
+# Collapse by individual, summing total costs & number of pregnancy-related visits
+a <- all.costs %>%
+  dplyr::group_by(DUPERSID) %>%
+  dplyr::summarise("tot.cost"=sum(EXP),"n.visits"=n()) %>%
+  dplyr::mutate("avg.cost"=tot.cost/n.visits)
+
+a$tot.cost[a$tot.cost==0] <- 1
+fit=fitdistr(a$tot.cost,"log-normal")$estimate
+mean.preg.cost <- mean(a$tot.cost) # Mean total cost for pregnancy-related visits is 2107
+#preg.costs <- c(d.preg$IPXP16X,e.preg$ERXP16X,f.preg$OPXP16X,g.preg$OBXP16X)
+#sum.preg.indivs <- length(unique(c(d.preg$DUPERSID,e.preg$DUPERSID,f.preg$DUPERSID,g.preg$DUPERSID)))
+#cost.per.preg <- sum(preg.costs)/sum.preg.indivs
+
+# FROM THE LONGITUDINAL FILE, HERE IS THE RELEVANT VISIT-TYPE INFO (TOTAL EXP and # VISITS)
+# OPTOTVY1 = # OUTPATIENT DEPT PROVIDER VISITS 15
+  # OPTEXPY1
+# OBTOTVY1 = # OFFICE-BASED PROVIDER VISITS 15
+  # OBVEXPY1
+# RXTOTY1 = # # PRESC MEDS INCL REFILLS 15
+  # RXEXPY1
+# HHINFDY1 = # INFORMAL HOME HEALTH PROVIDER DAYS 15
+# HHINDDY1 = # NON-AGENCY HOME HEALTH PROVIDR DAYS 15
+  # HHNEXPY1
+# DVORTHY1 = # ORTHODONTIST VISITS 15
+  # DVOEXPY1 or DVOTCHY1
+# DVGENY1 = # GENERAL DENTIST VISITS 15
+# ERTOTY1 # EMERGENCY ROOM VISITS 15
+# AMTHERY1 # AMB PT/OT THRPY VISITS (OB+OP) 15
+# AMASSTY1 # PHYSICIAN ASS T VSTS (OFF+OUPAT), 2015
+# AMOPTOY1 # AMB OPTOMETRIST VSTS (OB+OP) 15
+  # AMEEXPY1
+# AMNURSY1 # AMB NURSE/PRCTITIONR VSTS(OB+OP) 15
+  # AMNEXPY1
+# ERTOTY1 # EMERGENCY ROOM VISITS 15
+  # ERTEXPY1
+# IPZEROY1 # ZERO-NIGHT HOSPITAL STAYS 15
+  # ZIFEXPY1
+# DVTOTY1 # DENTAL CARE VISITS 15
+  # DVTEXPY1
+  
+```
+
+Now we select the appropriate sample from the dataset. For now, we will include all individuals who were in-scope for all 5 rounds of the survey, and also include those who were initially in scope but died in year 2. We also do a few cleaning steps to ensure that all individuals are between 0 and 65 years old.
+
+```{r Clean}
+dat <- subset(h193, ALL5RDS==1 | (DIED==1 & YEARIND==1))
+dat <- subset(dat, dat$AGEY1X>0) # Select only those with a positive age
+dat <- subset(dat, dat$AGEY1X<64) # Select only those with age < 65
+#dat <- subset(dat, dat$TTLPY1X>=0) # Select only those with a non-negative income
+#dat <- dat %>%
+#  left_join(h171[h171$DUPERSID %in% dat$DUPERSID,c(DUPERSID,TOTEXP14)], by=DUPERSID)
+```
+
+
+## Variable Adjustments
+
+Note that we'll need to make adjustments to income and spending, both to adjust for inflation and also to calibrate the MEPS.  First we need to adjust MEPS total spending to NHEA levels because the MEPS is known to underestimate expenditures. We therefore adjust prices up by a factor of 1.271859 to meet NHEA levels. We will need these adjustment factors later.
+
+```{r Adjustment factors}
+factor.2015 <- 1.08
+factor.2016 <- 1.06
+
+# Adjust income to 2019
+dat$TTLPY2X <- sapply(dat$TTLPY2X, function(x) x*factor.2016)   # adjust 2016 personal income $ to 2019 $
+dat$FAMINCY2 <- sapply(dat$FAMINCY2, function(x) x*factor.2016) # adjust 2016 family income $ to 2019 $
+```
+
+We don't need to (and don't want to) use every variable in the dataset. Here we create factors for the variables of interest. We also create a few new variables, such as a nonzero spending indicator, age group, a pregnancy indicator, and overall coverage status.
+
+We explored smoking, diabetes & high blood pressure but will not use these.  We also explored creating a "combined" health status, combining the self-reported health status and the actual data on chronic health factors, but this barely made any difference.
+
+
+```{r Factors}
+# Calculate total number of visits recorded in data - we'll need this later to calculate copays
+visit.list <- c("OPTOTVY1", "OBTOTVY1", "HHINFDY1", "HHINDDY1", "DVORTHY1", "DVGENY1", "DVTOTY1", "ERTOTY1", "AMTHERY1", "AMASSTY1", "AMOPTOY1", "AMNURSY1", "ERTOTY1", "IPZEROY1","RXTOTY1")
+visit.vars <- names(dat) %in% visit.list
+dat$TotVisits <- rowSums(dat[visit.vars])
+dat$RX <- dat$RXTOTY1
+  
+
+# Sex - just convert to factor
+dat$Sex <- factor(dat$SEX, labels=c("male","female"))
+
+# Age group
+#dat$Age <- dat$AGE
+dat$AgeGroupF[dat$AGE2X>=50]=4; dat$AgeGroupF[dat$AGE2X<50 & dat$AGE2X>=35]=3; dat$AgeGroupF[dat$AGE2X<35 & dat$AGE2X>=19]=2; dat$AgeGroupF[dat$AGE2X<19]=1
+#dat$AgeGroup <- factor(dat$AgeGroupF, labels=c("<18","19-24","25-44","45-65"), ordered=TRUE)
+dat$AgeGroup <- factor(dat$AgeGroupF, labels=c("<19","19-34","35-49","50-64"))
+# As it turns out, it does not matter if we designate AgeGroup as an ordered factor or unordered factor
+
+# Pregnancy - we consider anyone who was pregnant in any of rounds 2-4 to be "pregnant" since it is likely that the MEPS captured the entire span of these pregnancies
+dat$PregF <- 0
+dat$PregF[dat$PREGNT2==1 | dat$PREGNT3==1 | dat$PREGNT4==1] <- 1
+dat$Preg <- factor(dat$PregF, labels=c("not pregnant","pregnant"))
+
+# Health status
+dat$HealthStat[dat$RTHLTH3<=3] <- 1; dat$HealthStat[dat$RTHLTH3>3] <- 2; dat$HealthStat[dat$RTHLTH3<1] <- 0
+dat$HS <- factor(dat$HealthStat, labels=c("N/A","good","bad"))
+
+# USC provider status
+dat$USCF <- 0
+dat$USCF[dat$HAVEUS2==1 | dat$HAVEUS4==1] <- 2
+dat$USCF[dat$HAVEUS2==1 & dat$HAVEUS4==1] <- 1
+dat$USCF[dat$HAVEUS2==2 & dat$HAVEUS4==2] <- 3
+dat$USC <- factor(dat$USCF, labels=c("N/A","USC provider - both","USC provider - at one point","No USC provider"))
+
+# Race
+dat$RaceF[dat$RACETHX==1] <- 1
+dat$RaceF[dat$RACETHX==2] <- 2
+dat$RaceF[dat$RACETHX==3] <- 3
+dat$RaceF[dat$RACETHX==4 | dat$RACETHX==5] <- 4
+dat$Race <- factor(dat$RaceF, labels=c("hispanic","white","black", "other"))
+
+# Income
+#dat$Income <- dat$TTLPY2X # We keep this numeric --> REVISIT THIS DEPENDING ON ORDER IN INTEGRATED MODEL
+dat$Income <- dat$FAMINCY2 # We keep this numeric --> REVISIT THIS DEPENDING ON ORDER IN INTEGRATED MODEL
+
+# Poverty Level
+dat$PovCat <- 0
+dat$PovCat[dat$POVLEVY2<=138] <- 1
+dat$PovCat[dat$POVLEVY2>138 & dat$POVLEVY2<=250] <- 2
+dat$PovCat[dat$POVLEVY2>250 & dat$POVLEVY2<=400] <- 3
+dat$PovCat[dat$POVLEVY2>400 & dat$POVLEVY2<=550] <- 4
+dat$PovCat[dat$POVLEVY2>550 & dat$POVLEVY2<=700] <- 5
+dat$PovCat[dat$POVLEVY2>700] <- 6
+
+# ESI
+dat$ESI <- 0
+esi_vars <- as.vector(vars_select(names(dat), starts_with("PEG"))); esi_vars <-as.vector(vars_select(esi_vars, ends_with("2")))
+for (var in esi_vars){
+  dat$ESI[dat[var][[1]]==1] <- 1
+}
+dat$ESI <- factor(dat$ESI, labels=c("Non-ESI","ESI"))
+
+# EXCH
+dat$EXCH <- 0; dat$EXCH[dat$PRSTXY2==1] <- 1
+exch_vars <- as.vector(vars_select(names(dat), starts_with("PRX"))); exch_vars <- as.vector(vars_select(exch_vars, ends_with("2")))
+for (var in exch_vars){
+  dat$EXCH[dat[var][[1]]==1] <- 1
+}
+dat$EXCH <- factor(dat$EXCH, labels=c("Non-Exch","Exch"))
+
+# Non-Group
+dat$NonGroup <- 0
+ng_vars <- as.vector(vars_select(names(dat), starts_with("PNG"))); ng_vars <-as.vector(vars_select(ng_vars, ends_with("2")))
+for (var in ng_vars){
+  dat$NonGroup[dat[var][[1]]==1] <- 1
+}
+dat$NonGroup <- factor(dat$NonGroup, labels=c("Non-nongroup","NonGroup"))
+
+# Medicaid
+dat$Medicaid <- 0; dat$Medicaid[dat$MCDEVY2==1] <- 1
+mcd_vars <- as.vector(vars_select(names(dat), starts_with("MCD"))); mcd_vars <- as.vector(vars_select(mcd_vars, ends_with("Y2")))
+for (var in mcd_vars){
+  dat$Medicaid[dat[var][[1]]==1] <- 1
+}
+dat$Medicaid <- factor(dat$Medicaid, labels=c("Non-Medicaid","Medicaid"))
+
+
+# # Insurance category - first cut
+# dat$InsCatF[dat$PRSTXY2==1] <- 1 # Bought on Exchange - this is our nongroup
+# dat$InsCatF[dat$EXCH=="Exch"] <- 1 # Exchange
+# dat$InsCatF[dat$INSURCY2==1 & dat$PRSTXY2!=1] <- 2 # All Other Private
+# dat$InsCatF[dat$INSURCY2==2] <- 3 # Public
+# dat$InsCatF[dat$MCDEVY2==1] <- 4 # Ever Medicaid During Year
+# dat$InsCatF[dat$INSURCY2==3] <- 5 # Uninsured
+# dat$InsCatF[dat$INSURCY2>3 & dat$AGE5X==65 & dat$INSURCY1==1 & dat$PRSTXY1!=1] <- 2 # Was other private but reached age 65
+# dat$InsCatF[dat$INSURCY2>3 & dat$AGE5X==65 & dat$INSURCY1==2] <- 3 # Was public but reached age 65
+# dat$InsCatF[dat$INSURCY2>3 & dat$AGE5X==65 & dat$INSURCY1==3] <- 5 # Was uninsured but reached age 65
+# dat$InsCat0 <- factor(dat$InsCatF, labels=c("Exchange","Group Private","Public","Medicaid", "Uninsured"))
+# # NOTE: I am here including individuals who turn 65 in the last year of the panel - we can evaluate this later if desired
+
+
+# Our target population is exchange, nongroup, and uninsured. This has been cross-checked with Kandice
+dat$InsCat2[dat$INSURCY2==3] <- 4 # Uninsured
+dat$InsCat2[dat$INSURCY2==1] <- 5 # Other private
+dat$InsCat2[dat$NonGroup=="NonGroup" & dat$EXCH=="Non-Exch"] <- 1 # Nongroup - Should be separate but currently lumping with exchange for target pop
+dat$InsCat2[dat$EXCH=="Exch"] <- 1 # Exchange
+dat$InsCat2[dat$INSURCY2==2] <- 2 # Public
+dat$InsCat2[dat$INSURCY2>=4] <- 2 # Anyone on Medicare goes into "Other Public"
+dat$InsCat2[dat$Medicaid=="Medicaid"] <- 3 # Ever Medicaid During Year
+dat$InsCat <- factor(dat$InsCat2, labels=c("NonGroup Private","Other Public","Medicaid","Uninsured","Other Private"))
+ins.types <- c("NonGroup Private","Other Public","Medicaid","Uninsured","Other Private")
+
+# ## We actually do this whole thing again for year 1 so we can calculate transition probabilities
+# dat$NonGroup1 <- 0
+# ng_vars <- as.vector(vars_select(names(dat), starts_with("PNG"))); ng_vars <-as.vector(vars_select(ng_vars, ends_with("1")))
+# for (var in ng_vars){
+#   dat$NonGroup1[dat[var][[1]]==1] <- 1
+# }
+# dat$NonGroup1 <- factor(dat$NonGroup1, labels=c("Non-nongroup","NonGroup"))
+# 
+# dat$Medicaid1 <- 0; dat$Medicaid1[dat$MCDEVY1==1] <- 1
+# mcd_vars <- as.vector(vars_select(names(dat), starts_with("MCD"))); mcd_vars <- as.vector(vars_select(mcd_vars, ends_with("Y1")))
+# for (var in mcd_vars){
+#   dat$Medicaid1[dat[var][[1]]==1] <- 1
+# }
+# dat$Medicaid1 <- factor(dat$Medicaid1, labels=c("Non-Medicaid","Medicaid"))
+# dat$EXCH1 <- 0; dat$EXCH1[dat$PRSTXY1==1] <- 1
+# exch_vars <- as.vector(vars_select(names(dat), starts_with("PRX"))); exch_vars <- as.vector(vars_select(exch_vars, ends_with("1")))
+# for (var in exch_vars){
+#   dat$EXCH1[dat[var][[1]]==1] <- 1
+# }
+# dat$EXCH1 <- factor(dat$EXCH1, labels=c("Non-Exch","Exch"))
+# 
+# dat$ESI1 <- 0
+# esi_vars <- as.vector(vars_select(names(dat), starts_with("PEG"))); esi_vars <-as.vector(vars_select(esi_vars, ends_with("1")))
+# for (var in esi_vars){
+#   dat$ESI1[dat[var][[1]]==1] <- 1
+# }
+# dat$ESI1 <- factor(dat$ESI1, labels=c("Non-ESI","ESI"))
+# 
+# dat$InsCat1[dat$INSURCY1==3] <- 4 # Uninsured
+# dat$InsCat1[dat$INSURCY1==1] <- 5 # Other private
+# dat$InsCat1[dat$NonGroup1=="NonGroup" & dat$EXCH1=="Non-Exch"] <- 1 #S hould be 2 but currently lumping with exchange for target pop # Nongroup
+# dat$InsCat1[dat$EXCH1=="Exch"] <- 1 # Exchange
+# dat$InsCat1[dat$INSURCY1==2] <- 2 # Public
+# dat$InsCat1[dat$INSURCY1>=4] <- 2 # Anyone on Medicare goes into "Other Public"
+# dat$InsCat1[dat$Medicaid1=="Medicaid"] <- 3 # Ever Medicaid During Year
+# dat$InsCat1 <- factor(dat$InsCat1, labels=c("NonGroup Private","Other Public","Medicaid","Uninsured","Other Private"))
+# transitions <- matrix(data=0,nrow=5,ncol=5); colnames(transitions) <- ins.types; rownames(transitions) <- ins.types
+# transitions.up <- matrix(data=0,nrow=5,ncol=5); colnames(transitions.up) <- ins.types; rownames(transitions.up) <- ins.types
+# transitions.low <- matrix(data=0,nrow=5,ncol=5); colnames(transitions.low) <- ins.types; rownames(transitions.low) <- ins.types
+# for (i in ins.types){
+#   for (j in ins.types){
+#     transitions[i,j] <- nrow(dat[dat$InsCat1==i & dat$InsCat==j,])/nrow(dat[dat$InsCat1==i,])
+#     # transitions.up[i,j] <- nrow(dat[dat$FAMINCY2>(1.2*dat$FAMINCY1) & dat$InsCat==j & dat$InsCat1==i,])/nrow(dat[dat$FAMINCY2>(1.1*dat$FAMINCY1) & dat$InsCat1==i,])
+#     # transitions.low[i,j] <- nrow(dat[dat$FAMINCY2<(0.9*dat$FAMINCY1) & dat$InsCat==j & dat$InsCat1==i,])/nrow(dat[dat$FAMINCY2<(0.9*dat$FAMINCY1) & dat$InsCat1==i,])
+#     #     transitions.up[i,j] <- nrow(dat[dat$TTLPY2X>(1.2*dat$TTLPY1X) & dat$InsCat==j & dat$InsCat1==i,])/nrow(dat[dat$TTLPY2X>(1.1*dat$TTLPY1X) & dat$InsCat1==i,])
+#     # transitions.low[i,j] <- nrow(dat[dat$TTLPY2X<(0.9*dat$TTLPY1X) & dat$InsCat==j & dat$InsCat1==i,])/nrow(dat[dat$TTLPY2X<(0.9*dat$TTLPY1X) & dat$InsCat1==i,])
+#   }
+# }
+# #save(transitions, file=here("Notebooks/Integration/R_Objects/transitions.Rda"))
+```
+
+Next we need to adjust to Medicare and Medicaid prices, so that all dollars are considered equal. Insurance category might be an important predictor in the CART & regression models, but after this adjustment it should be a determininant of utilization rather than service fee. Remember that this model is primarily used for predicting medical expenditures for the 10Plan-eligible population.
+
+We need to look at the average cost of a visit of each type depending on insurance category. We use this to find inflation factors needed for each visit type - insurance category combination in order to adjust to Medicaid prices, assuming that our target population is more closely aligned to the Medicaid population in terms of health needs. We inflate the total costs using those type-specific factors, weighted by the proportion of expenditures of that visit type by insurance category. We can then build an index using a Medicaid-to-Medicare reimbursement ratio to adjust to Medicare prices, if desired.
+
+For now, we'll adjust to Medicare, but we will build models for the baseline (no price adjustments), Medicare prices, Medicaid prices, and Medicare + 10% prices. We also build a hybrid model where individuals under 400% get Medicaid prices and the rest get Medicare prices.
+
+```{r Pricing Adjustment Calculations}
+visit.types <- c("Inpatient","Outpatient","Office","ER","RX","HH1","HH2","Dental1","Dental2","Other")
+dentals <- c("DVOEXPY2","DVTEXPY2"); HH <- c("HHAEXPY2","HHNEXPY2")
+visit.names <- c("IPTEXPY2","OPTEXPY2","OBVEXPY2","ERTEXPY2", "RXEXPY2", HH, dentals, "ZIFEXPY2")
+dentals.v <- c("DVORTHY2", "DVTOTY2"); HH.v <- c("HHAGDY2", "HHINDDY2")
+visit.names.v <- c("IPDISY2", "OPTOTVY2", "OBTOTVY2", "ERTOTY2","RXTOTY2", HH.v, dentals.v, "IPZEROY2")
+
+props <- matrix(data=0,nrow=5,ncol=length(visit.types)); colnames(props) <- visit.types; rownames(props) <- ins.types # These are the proportions of each type of spending
+amts <- matrix(data=0,nrow=5,ncol=length(visit.types)); colnames(amts) <- visit.types; rownames(amts) <- ins.types # These are the amounts which we use to build inflation factors
+fctrs <- matrix(data=0,nrow=5,ncol=2); colnames(fctrs) <- c("Medicaid Inflation Factor","Medicare Inflation Factor"); rownames(fctrs) <- ins.types # These are the amounts which we use to build inflation factors
+vsts <- matrix(data=0,nrow=5,ncol=length(visit.types)); colnames(vsts) <- visit.types; rownames(vsts) <- ins.types
+amt.per.visit <- matrix(data=0,nrow=5,ncol=length(visit.types)); colnames(amt.per.visit) <- visit.types; rownames(amt.per.visit) <- ins.types
+amt.per.visit2 <- matrix(data=0,nrow=5,ncol=length(visit.types)); colnames(amt.per.visit2) <- visit.types; rownames(amt.per.visit2) <- ins.types
+
+for (i in ins.types){
+  for (j in visit.types){
+    props[i,j] <- mean(dat[dat$InsCat==i,visit.names[which(visit.types==j)]])/mean(dat[dat$InsCat==i,"TOTEXPY2"]) # Rows sum to approx 1 but need to adjust outside inner loop
+    # This is the population of this insurance category with nonzero spending and nonzero visits of this type
+    q <- which(dat$InsCat==i & dat[,visit.names.v[which(visit.types==j)]]>0 & dat[,visit.names[which(visit.types==j)]]>0)
+    
+    # Calculate average total amount paid on this type of care
+    #amts[i,j] <- mean(dat[q,visit.names[which(visit.types==j)]]) # Average spending this type for population q UNWEIGHTED
+    amts[i,j] <- sum(dat[q,visit.names[which(visit.types==j)]]*dat[q,"LONGWT"])/sum(dat[q,"LONGWT"]) # Same thing WEIGHTED
+
+    # Calculate average number of this type of visit
+    #vsts[i,j] <- mean(dat[q,visit.names.v[which(visit.types==j)]]) # Average number of visits of this type for population q UNWEIGHTED
+    vsts[i,j] <- sum(dat[q,visit.names.v[which(visit.types==j)]]*dat[q,"LONGWT"])/sum(dat[q,"LONGWT"]) # Same thing WEIGHTED
+
+    # Calculate average cost per visit
+    #amt.per.visit[i,j] <- mean(dat[q,visit.names[which(visit.types==j)]]/dat[q,visit.names.v[which(visit.types==j)]]) # Average cost per visit UNWEIGHTED
+    amt.per.visit[i,j] <- mean((sum(dat[q,visit.names[which(visit.types==j)]]*dat[q,"LONGWT"])/sum(dat[q,"LONGWT"]))/(sum(dat[q,visit.names.v[which(visit.types==j)]]*dat[q,"LONGWT"])/sum(dat[q,"LONGWT"]))) # Same thing WEIGHTED
+  }
+  props[i,] <- props[i,]/sum(props[i,]) # Adjust so that the total spending sums to 1 across types
+}
+
+# Set up various pricing schemes - now ONLY ADJUST THE 10P TARGET POPULATION
+for (i in ins.types){
+  fctrs[i,1] <- sum((amt.per.visit["Medicaid",]/amt.per.visit[i,])*props[i,],na.rm=TRUE) # Take the ratio of visit costs, multiply by proportion spent on that type of care
+  fctrs[i,2] <- fctrs[i,1]/0.72 # This uses the overall Medicare-to-Medicaid reimbursement rate from 2016 for all services in the United States
+}
+
+MCaid.factor <- fctrs["Other Private",1] # We scale by 0.637831 to get Medicaid prices
+MCare.factor <- fctrs["Other Private",2] # We scale by 0.8858764 to get Medicaid prices
+```
+
+## Dollar adjustments
+
+We now need to adjust income and spending dollars from 2015 and 2016 (the MEPS files we are using) to 2019 dollars. 
+
+```{r Dollar Adjust}
+factor.nhea <- 1.271859
+
+## Inflation adjustment
+dat$TOTEXPY1 <- sapply(dat$TOTEXPY1, function(x) x*factor.2015) # adjust 2015 $ to 2019 $
+dat$TOTEXPY2 <- sapply(dat$TOTEXPY2, function(x) x*factor.2016) # adjust 2016 $ to 2019 $
+
+## NHEA Adjustment
+dat$TOTEXPY1 <- sapply(dat$TOTEXPY1, function(x) x*factor.nhea) # adjust year 1 spending to NHEA levels
+dat$TOTEXPY2 <- sapply(dat$TOTEXPY2, function(x) x*factor.nhea) # adjust year 2 spending to NHEA levels
+```
+
+## Calibrate Medical Inflation
+
+We find that the weighted healthcare expenditures in year 2 are 1.068852 times that of the weighted healthcare expenditures in year 1.  This indicates a higher medical inflation rate than we would expect. Therefore we must recalibrate. We first normalize the year 2 expenditures by dividing by the weighted inflation rate, then we multiply by the desired inflation rate. We will peg inflation in 10Plan spending to historical growth in Medicare rates, rather than Medical CPI. We therefore assume a medical growth rate of 5.1% (source).
+
+```{r Inflation}
+med_inflation <-  1.051 # 1.044# Alternative is 1.044
+weighted.inflation <- sum(dat$TOTEXPY2*dat$LONGWT)/sum(dat$TOTEXPY1*dat$LONGWT)
+dat$TOTEXPY2 <- (dat$TOTEXPY2)/weighted.inflation * med_inflation
+
+```
+
+## Adjust Prices for Target Population
+
+```{r Adjust Prices}
+for (i in ins.types[c(1,4)]){
+  # Adjust 10Plan participants to Medicaid prices
+  dat$TOTEXPY1.MCaid[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCaid.factor #fctrs[i,1]
+  dat$TOTEXPY2.MCaid[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCaid.factor #fctrs[i,1]  
+  
+  # Adjust 10Plan participants to Medicare prices
+  dat$TOTEXPY1.MCare[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor #fctrs[i,2]
+  dat$TOTEXPY2.MCare[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor #fctrs[i,2]
+  
+  # Adjust 10Plan participants to Medicare prices+10%
+  dat$TOTEXPY1.MCarePlus10[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor*1.1 #fctrs[i,2]
+  dat$TOTEXPY2.MCarePlus10[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor*1.1 #fctrs[i,2]
+  
+  # Adjust 10Plan participants to Medicare prices+50%
+  dat$TOTEXPY1.MCarePlus50[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor*1.5 #fctrs[i,2]
+  dat$TOTEXPY2.MCarePlus50[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor*1.5 #fctrs[i,2]
+
+  # Adjust 10Plan participants to Medicare prices+100%
+  dat$TOTEXPY1.MCarePlus100[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor*2.0 #fctrs[i,2]
+  dat$TOTEXPY2.MCarePlus100[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor*2.0 #fctrs[i,2]
+  
+  # Adjust 10Plan participants to Medicare prices+134%
+  dat$TOTEXPY1.MCarePlus134[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor*2.34 #fctrs[i,2]
+  dat$TOTEXPY2.MCarePlus134[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor*2.34 #fctrs[i,2]  
+  
+  # Adjust 10Plan participants to Medicare prices-10%
+  dat$TOTEXPY1.MCareMinus10[dat$InsCat==i] <- dat$TOTEXPY1[dat$InsCat==i]*MCare.factor*0.9 #fctrs[i,2]
+  dat$TOTEXPY2.MCareMinus10[dat$InsCat==i] <- dat$TOTEXPY2[dat$InsCat==i]*MCare.factor*0.9 #fctrs[i,2]
+  
+  # Adjust 10Plan participants to Hybrid pricing scheme, where those under 400% FPL get Medicaid prices, and those over 400% FPL get Medicare prices
+  dat$TOTEXPY1.Hybrid[dat$InsCat==i & dat$PovCat<=3] <- dat$TOTEXPY1[dat$InsCat==i & dat$PovCat<=3]*MCaid.factor #fctrs[i,1]
+  dat$TOTEXPY2.Hybrid[dat$InsCat==i & dat$PovCat<=3] <- dat$TOTEXPY2[dat$InsCat==i & dat$PovCat<=3]*MCaid.factor #fctrs[i,1]
+  dat$TOTEXPY1.Hybrid[dat$InsCat==i & dat$PovCat>3] <- dat$TOTEXPY1[dat$InsCat==i & dat$PovCat>3]*MCare.factor #fctrs[i,2]
+  dat$TOTEXPY2.Hybrid[dat$InsCat==i & dat$PovCat>3] <- dat$TOTEXPY2[dat$InsCat==i & dat$PovCat>3]*MCare.factor #fctrs[i,2]
+  
+  # Adjust 10Plan participants to Alternative Hybrid pricing scheme, where those under 250% FPL get Medicaid prices, and those over 250% FPL get Medicare prices
+  dat$TOTEXPY1.Hybrid2[dat$InsCat==i & dat$PovCat<=2] <- dat$TOTEXPY1[dat$InsCat==i & dat$PovCat<=2]*MCaid.factor #fctrs[i,1]
+  dat$TOTEXPY2.Hybrid2[dat$InsCat==i & dat$PovCat<=2] <- dat$TOTEXPY2[dat$InsCat==i & dat$PovCat<=2]*MCaid.factor #fctrs[i,1]
+  dat$TOTEXPY1.Hybrid2[dat$InsCat==i & dat$PovCat>2] <- dat$TOTEXPY1[dat$InsCat==i & dat$PovCat>2]*MCare.factor #fctrs[i,2]
+  dat$TOTEXPY2.Hybrid2[dat$InsCat==i & dat$PovCat>2] <- dat$TOTEXPY2[dat$InsCat==i & dat$PovCat>2]*MCare.factor #fctrs[i,2]
+}
+
+dat$TOTEXPY1.Baseline <- dat$TOTEXPY1
+dat$TOTEXPY2.Baseline <- dat$TOTEXPY2
+
+dat$TOTEXPY1.MCaid[is.na(dat$TOTEXPY1.MCaid)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCaid)]
+dat$TOTEXPY2.MCaid[is.na(dat$TOTEXPY2.MCaid)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCaid)]
+dat$TOTEXPY1.MCare[is.na(dat$TOTEXPY1.MCare)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCare)]
+dat$TOTEXPY2.MCare[is.na(dat$TOTEXPY2.MCare)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCare)]
+dat$TOTEXPY1.MCarePlus10[is.na(dat$TOTEXPY1.MCarePlus10)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCarePlus10)]
+dat$TOTEXPY2.MCarePlus10[is.na(dat$TOTEXPY2.MCarePlus10)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCarePlus10)]
+dat$TOTEXPY1.MCarePlus50[is.na(dat$TOTEXPY1.MCarePlus50)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCarePlus50)]
+dat$TOTEXPY2.MCarePlus50[is.na(dat$TOTEXPY2.MCarePlus50)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCarePlus50)]
+dat$TOTEXPY1.MCarePlus100[is.na(dat$TOTEXPY1.MCarePlus100)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCarePlus100)]
+dat$TOTEXPY2.MCarePlus100[is.na(dat$TOTEXPY2.MCarePlus100)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCarePlus100)]
+dat$TOTEXPY1.MCarePlus134[is.na(dat$TOTEXPY1.MCarePlus134)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCarePlus134)]
+dat$TOTEXPY2.MCarePlus134[is.na(dat$TOTEXPY2.MCarePlus134)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCarePlus134)]
+dat$TOTEXPY1.MCareMinus10[is.na(dat$TOTEXPY1.MCareMinus10)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.MCareMinus10)]
+dat$TOTEXPY2.MCareMinus10[is.na(dat$TOTEXPY2.MCareMinus10)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.MCareMinus10)]
+dat$TOTEXPY1.Hybrid[is.na(dat$TOTEXPY1.Hybrid)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.Hybrid)]
+dat$TOTEXPY2.Hybrid[is.na(dat$TOTEXPY2.Hybrid)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.Hybrid)]
+dat$TOTEXPY1.Hybrid2[is.na(dat$TOTEXPY1.Hybrid2)]<-dat$TOTEXPY1[is.na(dat$TOTEXPY1.Hybrid2)]
+dat$TOTEXPY2.Hybrid2[is.na(dat$TOTEXPY2.Hybrid2)]<-dat$TOTEXPY2[is.na(dat$TOTEXPY2.Hybrid2)]
+
+ # We get the 0.72 Medicaid-to-Medicare number from https://www.kff.org/medicaid/state-indicator/medicaid-to-medicare-fee-index/?currentTimeframe=0&sortModel=%7B%22colId%22:%22Location%22,%22sort%22:%22asc%22%7D
+
+# FROM THE LONGITUDINAL FILE, HERE IS THE RELEVANT VISIT-TYPE INFO (TOTAL EXP and # VISITS)
+# OPTOTVY1 = # OUTPATIENT DEPT PROVIDER VISITS 15
+  # OPTEXPY1
+# OBTOTVY1 = # OFFICE-BASED PROVIDER VISITS 15
+  # OBVEXPY1
+# RXTOTY1 = # # PRESC MEDS INCL REFILLS 15
+  # RXEXPY1
+# HHINFDY1 = # INFORMAL HOME HEALTH PROVIDER DAYS 15
+# HHINDDY1 = # NON-AGENCY HOME HEALTH PROVIDR DAYS 15
+  # HHNEXPY1
+# DVORTHY1 = # ORTHODONTIST VISITS 15
+  # DVOEXPY1 or DVOTCHY1
+# DVTOTY1 = # DENTAL CARE VISITS 15
+  # DVTEXPY1
+# ERTOTY1 # EMERGENCY ROOM VISITS 15
+  # ERTEXPY1
+# AMTHERY1 # AMB PT/OT THRPY VISITS (OB+OP) 15
+# AMASSTY1 # PHYSICIAN ASS T VSTS (OFF+OUPAT), 2015
+# AMOPTOY1 # AMB OPTOMETRIST VSTS (OB+OP) 15
+  # AMEEXPY1
+# AMNURSY1 # AMB NURSE/PRCTITIONR VSTS(OB+OP) 15
+  # AMNEXPY1
+# IPZEROY1 # ZERO-NIGHT HOSPITAL STAYS 15
+  # ZIFEXPY1
+```
+
+
+## BEGIN
+We'll do a few different versions. Here we'll specify which type of run we're doing. Be careful when saving.
+```{r Version}
+#which.version <- "Baseline"
+which.version <- "MCare"
+#which.version <- "MCaid"
+#which.version <- "MCarePlus10"
+#which.version <- "MCarePlus50"
+#which.version <- "MCarePlus100"
+#which.version <- "MCarePlus134"
+#which.version <- "MCareMinus10"
+#which.version <- "Hybrid"
+#which.version <- "Hybrid2"
+
+behavioral <- "none"
+#behavioral <- "Aggressive"
+#behavioral <- "Conservative"
+if(med_inflation==1.044){behavioral <- "reduced_med_inflation"}
+
+
+name1 <- paste("TOTEXPY1.",which.version,sep=''); name2 <- paste("TOTEXPY2.",which.version,sep='')
+dat$TOTEXPY1 <- dat[,name1]; dat$TOTEXPY2 <- dat[,name2]
+```
+
+
+```{r Behavioral}
+load(file.path(path,'../../Data/h191.Rdata'))
+
+utilization.adjustment.ranges.uninsured <- matrix(0, nrow=4, ncol=2,dimnames=list(c("Outpatient","Inpatient","ER","All Other"),c("Conservative","Aggressive")))
+utilization.adjustment.ranges.uninsured[,1] <- c(1.056, 1.016, 0.768, 1.2)
+utilization.adjustment.ranges.uninsured[,2] <- c(1.44, 1.232, 1.328, 1.2)
+utilization.adjustment.ranges.insured <- matrix(0, nrow=5, ncol=2,dimnames=list(c("Deductible Not Met","Deductible Met - Outpatient","Deductible Met - Inpatient","Deductible Met - ER","Deductible Met - All Other"),c("Conservative","Aggressive")))
+utilization.adjustment.ranges.insured[,1] <- c(1.2, .86, .83, .79, .95)
+utilization.adjustment.ranges.insured[,2] <- c(1.2, .8, .8, .66, .75)
+
+nongrp <- dat[dat$InsCat=="NonGroup Private",]
+#length(which(nongrp$DUPERSID %in% h191$DUPERSID)) # All nongroups are in this file
+nongrp.round <- h191[which(h191$DUPERSID %in% nongrp$DUPERSID),]
+nongrp.round <- nongrp.round %>%
+  dplyr::group_by(DUPERSID) %>%
+  dplyr::summarise(COVTYPIN = names(sort(-table(COVTYPIN)))[1], ANNDEDCT = max(as.numeric(ANNDEDCT)), PLANMETL = max(PLANMETL))
+have.metal.or.deduct <- nongrp.round
+#have.metal.or.deduct <- nongrp.round[nongrp.round$PLANMETL>0 | (nongrp.round$ANNDEDCT==1 | nongrp.round$ANNDEDCT==2 | nongrp.round$ANNDEDCT==3),]
+have.metal.or.deduct[have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 4358  # Assuming average single deductible if we have no info
+have.metal.or.deduct[have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 7983  # Assuming average family deductible if we have no info
+have.metal.or.deduct[have.metal.or.deduct$ANNDEDCT==1 & have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 1300  # Assuming highest possible deductible
+have.metal.or.deduct[have.metal.or.deduct$ANNDEDCT==1 & have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 2600  # Assuming highest possible deductible
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==1 & have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 37    # Platinum single
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==1 & have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 140   # Platinum family
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==2 & have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 778   # Gold single
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==2 & have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 1835  # Gold family
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==3 & have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 2758  # Silver single
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==3 & have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 5424  # Silver family
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==4 & have.metal.or.deduct$COVTYPIN==1,"Deduct"] <- 7148  # Bronze single
+have.metal.or.deduct[have.metal.or.deduct$PLANMETL==4 & have.metal.or.deduct$COVTYPIN==2,"Deduct"] <- 12044 # Bronze family
+have.metal.or.deduct[have.metal.or.deduct$ANNDEDCT==3,"Deduct"] <- 0
+have.metal.or.deduct$Deduct <- have.metal.or.deduct$Deduct*1.04 # These numbers are from 2017, so convert to 2019 dollars
+# The estimates for deductible level come from https://www.ehealthinsurance.com/resources/individual-and-family/how-much-does-individual-health-insurance-cost 
+
+dat <- dat %>%
+  dplyr::left_join(have.metal.or.deduct[,c("DUPERSID","Deduct")], by="DUPERSID")
+
+uninsured.conservative <- utilization.adjustment.ranges.uninsured[1,1]*props[4,2] + utilization.adjustment.ranges.uninsured[2,1]*props[4,1] + utilization.adjustment.ranges.uninsured[3,1]*props[4,4] + utilization.adjustment.ranges.uninsured[4,1]*sum(props[4,c(3,5:10)])
+
+uninsured.aggressive <- utilization.adjustment.ranges.uninsured[1,2]*props[4,2] + utilization.adjustment.ranges.uninsured[2,2]*props[4,1] + utilization.adjustment.ranges.uninsured[3,2]*props[4,4] + utilization.adjustment.ranges.uninsured[4,2]*sum(props[4,c(3,5:10)])
+
+insured.unmet.conservative <- utilization.adjustment.ranges.insured[1,1]
+insured.unmet.aggressive <- utilization.adjustment.ranges.insured[1,2]
+
+insured.met.conservative <- utilization.adjustment.ranges.insured[2,1]*props[1,2] + utilization.adjustment.ranges.insured[3,1]*props[1,1] + utilization.adjustment.ranges.insured[4,1]*props[1,4] + utilization.adjustment.ranges.insured[5,1]*sum(props[1,c(3,5:10)])
+
+insured.met.aggressive <- utilization.adjustment.ranges.insured[2,2]*props[1,2] + utilization.adjustment.ranges.insured[3,2]*props[1,1] + utilization.adjustment.ranges.insured[4,2]*props[1,4] + utilization.adjustment.ranges.insured[5,2]*sum(props[1,c(3,5:10)])
+
+if(behavioral=="Conservative"){
+  dat[dat$InsCat=="Uninsured","TOTEXPY2"] <- dat[dat$InsCat=="Uninsured","TOTEXPY1"]*uninsured.conservative # Adjust uninsured
+  dat[dat$InsCat=="NonGroup Private","TOTEXPY2"] <- ifelse(dat[dat$InsCat=="NonGroup Private","TOTEXPY1"]<=dat[dat$InsCat=="NonGroup Private","Deduct"], dat[dat$InsCat=="NonGroup Private","TOTEXPY1"]*insured.unmet.conservative, dat[dat$InsCat=="NonGroup Private","Deduct"]*insured.unmet.conservative + (dat[dat$InsCat=="NonGroup Private","TOTEXPY1"] - dat[dat$InsCat=="NonGroup Private","Deduct"])*insured.met.conservative) # Adjust insured
+}
+
+if(behavioral=="Aggressive"){
+  dat[dat$InsCat=="Uninsured","TOTEXPY2"] <- dat[dat$InsCat=="Uninsured","TOTEXPY1"]*uninsured.aggressive # Adjust uninsured
+  dat[dat$InsCat=="NonGroup Private","TOTEXPY2"] <- ifelse(dat[dat$InsCat=="NonGroup Private","TOTEXPY1"]<=dat[dat$InsCat=="NonGroup Private","Deduct"], dat[dat$InsCat=="NonGroup Private","TOTEXPY1"]*insured.unmet.aggressive, dat[dat$InsCat=="NonGroup Private","Deduct"]*insured.unmet.aggressive + (dat[dat$InsCat=="NonGroup Private","TOTEXPY1"] - dat[dat$InsCat=="NonGroup Private","Deduct"])*insured.met.aggressive) # Adjust insured
+}
+save(insured.unmet.conservative,insured.unmet.aggressive,insured.met.conservative,insured.met.aggressive,uninsured.conservative,uninsured.aggressive,file="../Integration/R_Objects/BehavioralAdjustments.Rda")
+```
+
+Using our new factor variables, we create a list of the variables we actually want to consider in our model. The MEPS data has too many variables that are highly correlated with medical expenditure, so this is important. We subset our dataset to only include these variables, and we create an additional subset which includes only individuals with nonzero spending in year 2 (we will use this in step 2 for the CART model).
+
+```{r Varlist}
+# Indicator for nonzero medical expenditure
+dat$nonzeroF2 <- 0; dat$nonzeroF2[dat$TOTEXPY2!=0] <- 1 # nonzero spending in year 2
+dat$nonzeroF1 <- 0; dat$nonzeroF1[dat$TOTEXPY1!=0] <- 1 # nonzero spending in year 1
+dat$nonzeroY2 <- factor(dat$nonzeroF2,labels=c("zero","nonzero"))
+dat$nonzeroY1 <- factor(dat$nonzeroF1,labels=c("zero","nonzero"))
+
+keepvars <- names(dat) %in% c("LONGWT","LY1","LY2","InsCat2","AgeGroup","HS","Sex","Income","nonzeroY2","nonzeroY1","Race","Preg","USC","TOTEXPY1","TOTEXPY2", "RX", "TotVisits","InsCat","RTHLTH3")
+```
+
+
+We create a training and test set, although we probably won't be too concerned about overfitting here. We also create subsets of these with just the variables of interest. We split our population up based on nonzero health spending in year 1 and year 2: this is important for step 1 where we predict the probability of having nonzero health spending in year 2 based on spending in year 1; we only run the CART on individuals with nonzero spending in year 2; we will run a CART separately for individuals based on zero v. nonzero spending in year 1.
+
+```{r Sets}
+set.seed(33)
+trainIndex <- createDataPartition(dat$TOTEXPY2, p=0.85, list=FALSE, times = 1)
+train.dat <- dat[trainIndex, ]
+test.dat  <- dat[-trainIndex, ]
+
+dat.keep <- dat[keepvars]
+train.keep <- train.dat[keepvars]
+test.keep <- test.dat[keepvars]
+
+# Here this is ALL individuals we need to predict spending in year 2 for; "nz" stands for "nonzero"
+dat.nz <- subset(dat, nonzeroY2=="nonzero")
+train.nz <- subset(train.keep, nonzeroY2=="nonzero")
+test.nz <- subset(test.keep, nonzeroY2=="nonzero")
+
+# Here this is all individuals with nonzero spending in both years - these will get transformed & modeled via CART
+dat.nz.both <- subset(dat.nz, nonzeroY1=="nonzero")
+train.nz.both <- subset(train.nz, nonzeroY1=="nonzero")
+test.nz.both <- subset(test.nz, nonzeroY1=="nonzero")
+
+# Here this is all individuals with nonzero spending in year 2 - these will get transformed & modeled via CART
+dat.nz.2 <- subset(dat.nz, nonzeroY1=="zero")
+train.nz.2 <- subset(train.nz, nonzeroY1=="zero")
+test.nz.2 <- subset(test.nz, nonzeroY1=="zero")
+```
+
+We also create new variables which are the natural log transformation of total expenditure. This will help us deal with the skewed cost data in the CART. However, we will need to model individuals with $0 spending separately since we cannot take the natural logarithm of 0. Note that to re-transform the log of medical expenditures, we will need to apply a "smearing" factor to eliminate bias from the exponentiation of mean of logs (e.g. the arithmetic mean is downwardly biased towards geometric mean).
+
+```{r LogTransform}
+dat.nz.both$LY1 <- log(dat.nz.both$TOTEXPY1); train.nz.both$LY1 <- log(train.nz.both$TOTEXPY1); test.nz.both$LY1 <- log(test.nz.both$TOTEXPY1)
+dat.nz.both$LY2 <- log(dat.nz.both$TOTEXPY2); train.nz.both$LY2 <- log(train.nz.both$TOTEXPY2); test.nz.both$LY2 <- log(test.nz.both$TOTEXPY2)
+
+# We can't log transform year 1 expenditures here because they equal zero. However, we do it anyway just because we need the column to be there for later when we combine
+dat.nz.2$LY1 <- log(dat.nz.2$TOTEXPY1); train.nz.2$LY1 <- log(train.nz.2$TOTEXPY1); test.nz.2$LY1 <- log(test.nz.2$TOTEXPY1)
+dat.nz.2$LY2 <- log(dat.nz.2$TOTEXPY2); train.nz.2$LY2 <- log(train.nz.2$TOTEXPY2); test.nz.2$LY2 <- log(test.nz.2$TOTEXPY2)
+
+```
+
+## Stage 1 - Logistic Regression to Determine Probability of Nonzero Spending
+
+Our approach involves two main stages. First, we model the probability of incuring nonzero medical expenses.Then, given nonzero medical expenses, we model what those expenses are as a function of various demographic characteristics. For the first stage we will use a logistic regression. The second stage will be a classification and regression tree (CART), and regressions within each of the partitions identified by the CART.
+
+The first stage starts here, where we run a glm regression using a "logit" link. As we would hope, the model predicts a high probability of nonzero spending for most of the individuals with high year 2 spending. However, there are many individuals who are misclassified, and the `nagelkerke()` command gives us "pseudo-R sqared" values between 0.24 - 0.34. We'll save our glm as an .Rda object so that we can reload it later.
+
+```{r Logit}
+mylogit1 <- glm(nonzeroY2 ~ AgeGroup + Sex + HS + InsCat + nonzeroY1 + Preg + Race + Income, family = binomial(link="logit"), data=train.dat)
+mylogit2 <- glm(nonzeroY2 ~ AgeGroup + Sex + HS + InsCat + TOTEXPY1 + Preg + Race + Income, family = binomial(link="logit"), data=train.dat)
+mylogit3 <- glm(nonzeroY2 ~ AgeGroup + Sex + HS + InsCat + TOTEXPY1 + nonzeroY1 + Preg + Race + Income, family = binomial(link="logit"), data=train.dat)
+mylogit <- mylogit3 # This one seems to work best, but only outperforms mylogit1 slightly
+# However, it does have the smallest AIC and results in the greatest drop between null & residual deviance
+nagelkerke(mylogit); summary(mylogit)
+predict <- predict(mylogit, test.dat, type="response") # This throws a warning about rank-deficiency, but from what I've read, I think this can be ignored
+plot(predict,test.dat$TOTEXPY2, xlab="P(nonzero spending)", ylab="Year 2 Spending",pch=20,cex=0.6)
+plot(predict,col=ifelse(((test.dat$nonzeroY2=="nonzero" & predict<=0.6) | (test.dat$nonzeroY2=="zero" & predict>=0.6)),"red","black"),pch=20,cex=1,xlab="Index",ylab="P(nonzero spending)",main="Mislabeled Instances in Red") # Red dots would be incorrectly specified with a p=0.6 threshold
+pred <- prediction(predict,test.dat$nonzeroF2)
+#myRoc <- roc(predictor=predict,response=test.dat$nonzeroF2); plot(myRoc)
+#matplot(data.frame(myRoc$sensitivities, myRoc$specificities), x = myRoc$thresholds, type='l', xlab = 'threshold', ylab='TPR, TNR')
+perf <- performance(pred,"tpr","fpr")
+plot(perf,colorize=TRUE) #ROC curve - a threshold of about 0.75 should work well
+
+#legend('bottomright', legend=c('TPR', 'TNR'), lty=1:2, col=1:2)
+```
+
+## Stage 2 - CART Model to Determine Partitions
+
+Now that we have a model for predicting who will have nonzero medical expenditures in a given year, we can model what those expenditures are. We build a CART, using the LONGWT variable from MEPS to weight each observation appropriately. We control the complexity of the tree by indicating that we only want to accept splits that decrease lack of fit by a factor of `cp`. Here, we create two CARTs for comparison: first with a training set, and then with the full dataset for comparison. We consider age, sex, health status, pregnancy status, total income, past year's medical spending, race, and insurance category in determining our most meaningful partitions. 
+
+Typically with CART, we want to grow the tree out to a greater-than-desired complexity, then prune back to keep only the most meaningful splits. A good rule of thumb is to cut the tree at the lowest level where `rel_error + xstd < xerror`.  The `summary()` function gives these metrics. We see that with this rule of thumb, we would have a much more complex tree than we probably want for our purposes. Thus, we can cut at about `cp=0.008`.
+
+```{r CART}
+# model.train <- rpart(LY2~ AgeGroup + Sex + HS + Preg + Income + LY1 + Race + InsCat, data=train.nz.both, method="anova",control=rpart.control(cp=0.001), weights=train.nz.both$LONGWT) # This one is built using a training set (85% of full dataset)
+# model.full <- rpart(LY2~ AgeGroup + Sex + HS + Preg + Income + LY1 + Race + InsCat, data=dat.nz.both, method="anova",control=rpart.control(cp=0.001), weights=dat.nz.both$LONGWT) # This one is built using the full dataset
+# A=prune(model.train,cp=0.007); B=prune(model.full,cp=0.007) # Pruning; here, A is on training set, B is on full set
+# rpart.plot(A); rpart.plot(B) # Plot nicely
+# rsq.rpart(A); rsq.rpart(B) # Plot approximate r-square for the splits, with relative error from cross validation
+# #summary(A); summary(B)
+```
+
+
+
+We now want to exclude pregnant individuals from our two-stage CART analysis, and estimate the cost of pregnancy and childbirth separately. Here, we build a CART excluding all pregnant individuals.
+
+```{r CART nonpreg}
+dat.np.both <- subset(dat.nz.both, dat.nz.both$Preg=="not pregnant")
+train.np.both <- subset(train.nz.both, train.nz.both$Preg=="not pregnant")
+model.train <- rpart(LY2~ AgeGroup + Sex + HS + Income + LY1 + Race + InsCat, data=train.np.both, method="anova",control=rpart.control(cp=0.001), weights=train.np.both$LONGWT) # This one is built using a training set (85% of full dataset)
+model.full <- rpart(LY2~ AgeGroup + Sex + HS + Income + LY1 + Race + InsCat, data=dat.np.both, method="anova",control=rpart.control(cp=0.001), weights=dat.np.both$LONGWT) # This one is built using the full dataset
+C=prune(model.train,cp=0.0058); #D=prune(model.full,cp=0.005) # Pruning; here, a is on training set, b is on full set
+rpart.plot(C); #rpart.plot(D) # Plot nicely
+rsq.rpart(C); #rsq.rpart(D) # Plot approximate r-square for the splits, with relative error from cross validation
+#summary(C); summary(D)
+
+# We'll continue using model "C", the one trained on 85% of the full set
+# We will generate predictions for the full set from this model, and this will provide a "label" which tells us which partition each individual is in
+Predictions <- predict(C, dat.np.both); dat.np.both <- cbind(dat.np.both, Predictions)
+plot(dat.np.both$LY2, Predictions, xlab="ln(Year 2 Spending)", ylab="CART Prediction")
+Predictions.all <- predict(C, dat.nz.both); dat.nz.both <- cbind(dat.nz.both, Predictions.all)
+
+#initial.model <- rpart(LY2~ AgeGroup + Sex + Income + HS + Race + InsCat, data=train.np.both, method="anova",control=rpart.control(cp=0.001), weights=train.np.both$LONGWT)
+#I <- prune(initial.model, cp=0.007); rpart.plot(I); rsq.rpart(I)
+
+# Save CART as an .RDA object to use later
+nonzero.CART <- C
+#save(nonzero.CART, file="CART.Rda")
+# residuals(C)
+```
+
+We will continue with the partitions from "Model C" of this segment. This tree excludes pregnant individuals, was trained on 85% of our dataset, and divides the dataset into 8 partitions based on last year's spending, income, age group, and health status.
+
+Let's also build a CART to investigate spending in year 2 for individuals who had zero spending in year 1. Again, we will exclude pregnancy. Obviously here we are not going to use spending in year 1 as a predictor variable.
+
+```{r CART nonpreg zeros}
+# Idea: this doesn't do very well so maybe in the simulation, if individual is predicted to have nonzero spending in year 3 after zero spending the previous year, the spending can be predicted based on the last nonzero year of spending (if possible); otherwise this model is used
+dat.np.2 <- subset(dat.nz.2, dat.nz.2$Preg=="not pregnant")
+train.np.2 <- subset(train.nz.2, train.nz.2$Preg=="not pregnant")
+model.train <- rpart(LY2~ AgeGroup + Sex + HS + Income + Race + InsCat, data=train.np.2, method="anova",control=rpart.control(cp=0.001), weights=train.np.2$LONGWT) # This one is built using a training set (85% of full dataset)
+model.full <- rpart(LY2~ AgeGroup + Sex + HS + Income + Race + InsCat, data=dat.np.2, method="anova",control=rpart.control(cp=0.001), weights=dat.np.2$LONGWT) # This one is built using the full dataset
+E=prune(model.train,cp=0.017); G=prune(model.full,cp=0.01335) # Pruning; here, a is on training set, b is on full set
+E=prune(model.train,cp=0.03);
+rpart.plot(E); rpart.plot(G) # Plot nicely
+rsq.rpart(E); rsq.rpart(G) # Plot approximate r-square for the splits, with relative error from cross validation
+#summary(E); summary(F)
+
+# We will generate predictions for the full set from this model, and this will provide a "label" which tells us which partition each individual is in
+Predictions <- predict(G, dat.np.2); dat.np.2 <- cbind(dat.np.2, Predictions)
+plot(dat.np.2$LY2, Predictions, xlab="ln(Year 2 Spending)", ylab="CART Prediction")
+Predictions.all <- predict(G, dat.nz.2); dat.nz.2 <- cbind(dat.nz.2, Predictions.all)
+
+AfterZeroPred <- glm(LY2 ~ AgeGroup + Sex + HS + USC + InsCat + Race + Income, family = gaussian(link="identity"), data=train.np.2)
+summary(AfterZeroPred)
+zero.CART <- E
+```
+
+For those individuals with zero spending in year 1, their spending in year 2 seems to depend most on their insurance category. This makes sense. Later, it might be worth investigating the importance of transitions in insurance category, though we probably won't have access to this information for our simulation. 
+
+## Regressions on Partitions
+
+Now we will build regression models on each partition, because we don't actually want to assign the same value for year 2 spending to all individuals in each partition - we want to capture some variance. Once we've built these regressions, we can compare the predicted spending distributions to the actual spending distributions for each partition.
+
+In the following code, we build a regression model for each leaf of the tree.  We iterate through each leaf number, ensuring that all of our regression's covariates have at least two levels in that leaf. We train each leaf's regression on only the data that would fall into that leaf.
+
+We must check for heteroskedasticity - the nonzero regression for leaf 3 & the regression for zero spending in year 1 are heteroskedastic. Thus we'll use separate smearing factors so as not to bias the other groups.
+
+```{r Partitions}
+l1 <- length(unique(nonzero.CART$where))
+partition.regressions <- vector(mode="list", length=l1)
+n.visits <- vector(mode="list", length=l1)
+smears <- vector(length=l1)
+for (leaf in unique(nonzero.CART$where)){
+  subset <- subset(dat.np.both, rpart.predict.leaves(nonzero.CART, dat.np.both, type="where")==leaf)
+  if (length(unique(subset$HS))==1){
+    regression <- glm(LY2 ~ LY1 + InsCat + AgeGroup + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$Sex))==1){
+    regression <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$AgeGroup))==1){
+    regression <- glm(LY2 ~ LY1 + InsCat + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$Race))==1){
+    regression <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$InsCat))==1){
+    regression <- glm(LY2 ~ LY1 + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else {
+    regression <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  }
+  partition.regressions[[leaf]] <- regression
+  smears[[leaf]] <- mean(exp(sapply(subset[,"LY2"],function(x) x-mean(subset[,"LY2"]))))
+}
+
+# These aren't very good so we'll stick with one regression
+z.partition.regressions <- vector(mode="list", length=length(unique(zero.CART$where)))
+for (leaf in unique(zero.CART$where)){
+  subset <- subset(dat.np.2, rpart.predict.leaves(zero.CART, dat.np.2, type="where")==leaf)
+  if (length(unique(subset$HS))==1){
+    regression <- glm(LY2 ~ InsCat + AgeGroup + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$Sex))==1){
+    regression <- glm(LY2 ~ InsCat + AgeGroup + HS + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$AgeGroup))==1){
+    regression <- glm(LY2 ~ InsCat + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$Race))==1){
+    regression <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income, family=gaussian(link="identity"), data = subset)
+  } else if (length(unique(subset$InsCat))==1){
+    regression <- glm(LY2 ~ AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  } else {
+    regression <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+  }
+  z.partition.regressions[[leaf]] <- regression
+}
+z.partition.regression <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = dat.np.2)
+z.smear <- mean(exp(sapply(dat.np.2[,"LY2"],function(x) x-mean(dat.np.2[,"LY2"]))))
+
+
+# for (leaf in unique(nonzero.CART$where)){
+#   subset <- subset(dat.np.both, rpart.predict.leaves(nonzero.CART, dat.np.both, type="where")==leaf)
+#   if (length(unique(subset$HS))==1){
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + InsCat2 + AgeGroup + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+#   } else if (length(unique(subset$Sex))==1){
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + InsCat2 + AgeGroup + HS + Income + Race, family=gaussian(link="identity"), data = subset)
+#   } else if (length(unique(subset$AgeGroup))==1){
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + InsCat2 + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+#   } else if (length(unique(subset$Race))==1){
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + InsCat2 + AgeGroup + HS + Sex + Income, family=gaussian(link="identity"), data = subset)
+#   } else if (length(unique(subset$InsCat2))==1){
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+#   } else {
+#     regression <- glm(TOTEXPY2 ~ TOTEXPY1 + InsCat2 + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset)
+#   }
+#   partition.regressions[[leaf]] <- regression
+# }
+# if we index using leaf, need to use those leafs to access the regressions
+
+
+# NOTE: WHAT I HAVE ABOVE IS MUCH MORE EFFICIENT THAN THE METHOD I WAS ATTEMPTING BELOW
+
+# ## NEED TO EXTRACT ACTUAL CUTOFFS
+# rules <- rpart.subrules.table(nonzero.CART)[,3] # Here we extract the feature values that determine splits
+# rules <- as.numeric(rules); rules <- rules[!is.na(rules)] # Here we just keep the numeric ones
+# rules2 <- rpart.subrules.table(zero.CART)[,4] # Here we extract the feature values that determine splits
+# rules2 <- as.numeric(rules2); rules2 <- rules2[!is.na(rules2)] # Here we just keep the numeric ones
+# # The index in "rules" corresponds to which split the threshold serves
+# rpart.predict.leaves()
+# C$where()
+# nonzero.CART
+# 
+# # Note: we separate into partitions all individuals with nonzero spending, even the pregnant women
+# dat.nz.both$Partition <- ifelse(dat.nz.both$LY1<rules[1], ifelse(dat.nz.both$LY1<rules[2], 1,ifelse(dat.nz.both$Income<rules[3],2,3)),ifelse(dat.nz.both$LY1<rules[4],ifelse(dat.nz.both$AgeGroup=="<18" | dat.nz.both$AgeGroup=="19-24" | dat.nz.both$AgeGroup=="25-44",4,5) ,ifelse(dat.nz.both$LY1<rules[5],ifelse(dat.nz.both$HS=="good",6,7),8)))
+# #table(dat.nz.both$Predictions.all,dat.nz.both$Partition) # CHECK THIS WORKS
+# dat.nz.2$Partition <- ifelse(dat.nz.2$InsCat=="Exchange" | dat.nz.2$InsCat=="Public" | dat.nz.2$InsCat=="Uninsured",9,ifelse(dat.nz.2$AgeGroup=="<18" | dat.nz.2$AgeGroup=="19-24",10,ifelse(dat.nz.2$Income>=rules2,11,12)))
+# 
+# dat.nz.combined <- rbind(dat.nz.both,dat.nz.2)
+# 
+# regression.1 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==1))
+# regression.2 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==2))
+# regression.3 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==3))
+# regression.4 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==4))
+# regression.5 <- glm(LY2 ~ LY1 + InsCat + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==5)) # AgeGroup does not vary
+# regression.6 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==6)) # HS does not vary
+# regression.7 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==7)) # HS does not vary
+# regression.8 <- glm(LY2 ~ LY1 + InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==8))
+# regression.9 <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==9))
+# regression.10 <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==10))
+# regression.11 <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==11))
+# regression.12 <- glm(LY2 ~ InsCat + AgeGroup + HS + Sex + Income + Race, family=gaussian(link="identity"), data = subset(dat.nz.combined, dat.nz.combined$Partition==12))
+# 
+# predict1 <- predict(regression.1, subset(dat.nz.combined,dat.nz.combined$Partition==1), type="response")
+# predict2 <- predict(regression.2, subset(dat.nz.combined,dat.nz.combined$Partition==2), type="response")
+# predict3 <- predict(regression.3, subset(dat.nz.combined,dat.nz.combined$Partition==3), type="response")
+# predict4 <- predict(regression.4, subset(dat.nz.combined,dat.nz.combined$Partition==4), type="response")
+# predict5 <- predict(regression.5, subset(dat.nz.combined,dat.nz.combined$Partition==5), type="response")
+# predict6 <- predict(regression.6, subset(dat.nz.combined,dat.nz.combined$Partition==6), type="response")
+# predict7 <- predict(regression.7, subset(dat.nz.combined,dat.nz.combined$Partition==7), type="response")
+# predict8 <- predict(regression.8, subset(dat.nz.combined,dat.nz.combined$Partition==8), type="response")
+# predict9 <- predict(regression.9, subset(dat.nz.combined,dat.nz.combined$Partition==9), type="response")
+# predict10 <- predict(regression.10, subset(dat.nz.combined,dat.nz.combined$Partition==10), type="response")
+# predict11 <- predict(regression.11, subset(dat.nz.combined,dat.nz.combined$Partition==11), type="response")
+# predict12 <- predict(regression.12, subset(dat.nz.combined,dat.nz.combined$Partition==12), type="response")
+# 
+# par(mfrow=c(3,4))
+# hist(predict1,col=rgb(0,0,1,1/4), main="Group 1, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==1],col=rgb(1,0,0,1/4),add=T)
+# hist(predict2,col=rgb(0,0,1,1/4), main="Group 2, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==2],col=rgb(1,0,0,1/4),add=T)
+# hist(predict3,col=rgb(0,0,1,1/4), main="Group 3, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==3],col=rgb(1,0,0,1/4),add=T)
+# hist(predict4,col=rgb(0,0,1,1/4), main="Group 4, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==4],col=rgb(1,0,0,1/4),add=T)
+# hist(predict5,col=rgb(0,0,1,1/4), main="Group 5, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==5],col=rgb(1,0,0,1/4),add=T)
+# hist(predict6,col=rgb(0,0,1,1/4), main="Group 6, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==6],col=rgb(1,0,0,1/4),add=T)
+# hist(predict7,col=rgb(0,0,1,1/4), main="Group 7, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==7],col=rgb(1,0,0,1/4),add=T)
+# hist(predict8,col=rgb(0,0,1,1/4), main="Group 8, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==8],col=rgb(1,0,0,1/4),add=T)
+# hist(predict9,col=rgb(0,0,1,1/4), main="Group 9, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==9],col=rgb(1,0,0,1/4),add=T)
+# hist(predict10,col=rgb(0,0,1,1/4), main="Group 10, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==10],col=rgb(1,0,0,1/4),add=T)
+# hist(predict11,col=rgb(0,0,1,1/4), main="Group 11, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==11],col=rgb(1,0,0,1/4),add=T)
+# hist(predict12,col=rgb(0,0,1,1/4), main="Group 12, Red=Actual",xlim=c(0,12)); hist(dat.nz.combined$LY2[dat.nz.combined$Partition==12],col=rgb(1,0,0,1/4),add=T)
+
+if(behavioral=="none"){
+  filename <- paste("../Integration/R_Objects/CART_", which.version, ".Rda",sep='')
+} else if (behavioral!="none"){
+  filename <- paste("../Integration/R_Objects/CART_", which.version, "_", behavioral, ".Rda", sep='')
+}
+
+save(mylogit, smears, z.smear, dat.np.both, nonzero.CART, zero.CART, partition.regressions, z.partition.regression, dat, file=filename)
+
+```
+
+
+## Re-transforming Medical Expenditures
+
+Recall that we have conducted this analysis on the natural log of medical expenditures. We need to re-transform the numbers back into their exponentiated values. However, it is known that there is a downward bias in this process, so we need to apply a smearing factor. We can use Duan's common smearing factor, phi = (1/N) sum_i (exp(observation_i - mean)).  This factor, phi, is then multiplied by the exponentiated observation. 
+
+
+
+
+## Estimating Number of Visits
+
+Each visit will require the 10Plan enrollees to pay a $25 copay OOP. Therefore, we need to estimate the number of visits for each individual each year. For now, we will randomly draw a number of visits from the distribution of visits for the appropriate quantile.
+
+```{r NVisits}
+quants <- quantile(dat$TOTEXPY1,seq(0.05,1,.05))
+quants <- quantile(dat$TOTEXPY1[dat$TOTEXPY1!=0],seq(0.05,1,.05),names=FALSE) # These are for nonzero visits - this is what we should use
+
+# This version is slower
+# estimate.visits0 <- function(predicted.expenditure) {
+#   if (predicted.expenditure==0) {
+#     predicted.visits <- sample(subset(dat, dat$TOTEXPY1==0)$TotVisits, 1)
+#   } else {
+#     Q <- ecdf(subset(dat, dat$TOTEXPY1!=0)$TOTEXPY1)(predicted.expenditure)*10 # This gives 10*quantile
+#     if (round(Q)==floor(Q)){
+#       s <- dat$TotVisits[dat$TOTEXPY1>=quantile(dat$TOTEXPY1[dat$TOTEXPY1!=0],round(Q)/10)[[1]] & dat$TOTEXPY1<quantile(dat$TOTEXPY1[dat$TOTEXPY1!=0],round(Q)/10+.05)[[1]]]
+#     } else {
+#       s <- dat$TotVisits[dat$TOTEXPY1>=quantile(dat$TOTEXPY1[dat$TOTEXPY1!=0],round(Q)/10-.05)[[1]] & dat$TOTEXPY1<quantile(dat$TOTEXPY1[dat$TOTEXPY1!=0],round(Q)/10)[[1]]]
+#     }
+#     predicted.visits <- sample(s, 1)
+#   }
+#   return(max(1,predicted.visits))
+# }
+
+# It's faster to pre-allocate the matrix with the samples from which we draw
+quant.mat <- matrix(data = NA, nrow = 20, ncol = 562+2)
+quant.mat[,1] <- seq(0.05,1,.05); quant.mat[,2] <- quants
+
+# Here we store the distributions, one for each of the 20 quantiles. Each has about 560 to draw from
+for (i in 1:nrow(quant.mat)){
+  if (i==1){
+    d <- dat$TotVisits[dat$TOTEXPY1>0 & dat$TOTEXPY1< quant.mat[i,2]]
+  } else {
+    d <- dat$TotVisits[dat$TOTEXPY1>=quant.mat[i-1,2] & dat$TOTEXPY1<quant.mat[i,2]]
+  }
+  d 
+  fill <- rep(mean(d),max(562-length(d),0)); d <- c(d,fill)
+  quant.mat[i,3:ncol(quant.mat)] <- d;
+}
+quant.mat <- round(quant.mat, digits=0)
+
+
+# Now we estimate visits. Based on a predicted expenditure, we draw from the appropriate distribution to predict the number of visits, and thus the number of copays.
+estimate.visits <- function(predicted.expenditure) {
+  if (predicted.expenditure==0) {
+    predicted.visits <- sample(subset(dat, dat$TOTEXPY1==0)$TotVisits, 1)
+    print("zero")
+  } else if (predicted.expenditure >= quant.mat[nrow(quant.mat),2]){
+    s <- quant.mat[nrow(quant.mat),3:ncol(quant.mat)]
+    print("pre-large")
+    predicted.visits <- sample(s, 1)
+    print("post_large")
+  } else {
+      i <- min(which(quant.mat[,2] > predicted.expenditure)) # The row allows for expenditures up to this value
+      s <- quant.mat[i,3:ncol(quant.mat)]
+      print("pre")
+      predicted.visits <- sample(s, 1)
+      print("post")
+  }
+  minim <- ifelse(predicted.expenditure==0, 0, 1)
+  print(predicted.visits)
+  return(max(minim,predicted.visits))
+}
+
+visits.for.zero <- subset(dat, dat$TOTEXPY1==0)$TotVisits
+
+est.visits <- function(pop){
+  v <- vector(length=nrow(pop))
+  z <- which(pop["MedSpend"]==0); l <- which(pop["MedSpend"] >= quant.mat[nrow(quant.mat),2]); s <- setdiff(1:nrow(pop),c(z,l))
+  v[z] <- sample(visits.for.zero, length(z), replace=TRUE) # This is fine but we should remove reliance on dat or else save it
+  v[l] <- sample(quant.mat[nrow(quant.mat),3:ncol(quant.mat)], length(l), replace=TRUE) # This is fine, just dependent on quant.mat
+  i <- sapply(pop[s,"MedSpend"],function(x) min(which(quant.mat[,2]>x))) # Get row indices to use on quant.mat
+  v[s] <- sapply(i, function(x) sample(quant.mat[x,3:ncol(quant.mat)], 1, replace=TRUE)) # This will sample from the appropriate distribution
+  v <- ifelse(pop[,"MedSpend"]>0,pmax(0,v),v)
+  return(v)
+}
+
+total.OOP <- function(expenditures, visits){
+  copays <- min(25*max(1,visits), expenditures)
+  #med.payments <- min(25*medicines)
+  return(copays)
+}
+#save(quant.mat,visits.for.zero,est.visits,total.OOP,file="../Integration/R_Objects/nvisits.Rda")
+#save(mylogit, file="../Integration/R_Objects/zvnz_logit.Rda")
+
+
+save(quant.mat, visits.for.zero, est.visits, total.OOP, file="../Integration/R_Objects/Visits.Rda")
+```
+
+```{r Events}
+# # Dental
+# gen totvisit_pmt = dvxp`k'x if length(evntidx)~=0
+# gen visittyp = "dental" if dvxp`k'x~=.
+# 
+# # OtherMed
+# replace totvisit_pmt = omxp`k'x if omxp`k'x~=.
+# replace visittyp = "othmed" if omxp`k'x~=.
+# 
+# # Office
+# replace totvisit_pmt = obxp`k'x if obxp`k'x~=.
+# replace visittyp = "office" if obxp`k'x~=.
+# 
+# doc_pmt = ipdxp`k'x if ipdxp`k'x~=.
+# doc_pmt = erdxp`k'x if erdxp`k'x~=.
+# doc_pmt = opdxp`k'x if opdxp`k'x~=.
+# fac_pmt = ipfxp`k'x if ipfxp`k'x~=.
+# fac_pmt = erfxp`k'x if erfxp`k'x~=.
+# fac_pmt = opfxp`k'x if opfxp`k'~=.
+# totvisit_pmt = doc_pmt + fac_pmt if totvisit_pmt==. 
+# 
+# # Inpatient, outpatient, ER
+# replace visittyp = "inpt" if ipdxp`k'x ~=. | ipfxp`k'x~=.
+# replace visittyp = "outpt" if opdxp`k'x ~=. | opfxp`k'x~=.
+# replace visittyp = "er" if erdxp`k'x ~=. | erfxp`k'x~=.
+# 
+# # HH
+# replace totvisit_pmt = hhxp`k' if hhxp`k'~=.
+# replace visittyp = "hh" if hhxp`k'~=.
+# 
+# # Append all visit files
+# # Create new vars for visit type and visit cost
+
+```
+
+

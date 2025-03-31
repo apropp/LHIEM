@@ -14,11 +14,11 @@ To run the model, navigate to `LHIEM/Integration/10Plan_RunFile.R` and run the p
 
 The file `10Plan_RunFile_COVID.R` is a version of the model that was adapted to analyze the 10Plan policy under COVID conditions.
 
-The folder `LHIEM/Integration/FunctionScripts/` contains all of the functions written for the model, organized by submodel. This is intended to streamline adaptation for other policy questions. For three of these (fertility, health status, and mortality), there are tutorial notebooks that walk through the overall logic of these submodels. These can be found at `LHIEM/Fertility/Modeling Brirths.Rmd`, `LHIEM/Health Status/Predicting The Dynamics of Health Status-v3.Rmd`, and `LHIEM/Mortality/Predicting_Mortality_from_Health_Spending.Rmd`, respectively.
+The folder `LHIEM/Integration/FunctionScripts/` contains all of the functions written for the model, organized by submodel. This is intended to streamline adaptation for other policy questions. For four of these (fertility, health status, mortality, and medical expenditures), there are tutorial notebooks that walk through the overall logic of these submodels. These can be found at `LHIEM/Fertility/Modeling Brirths.Rmd`, `LHIEM/Health Status/Predicting The Dynamics of Health Status-v3.Rmd`, `LHIEM/Mortality/Predicting_Mortality_from_Health_Spending.Rmd`, and `LHIEM/Medical Expenditures/10PlanExpenditures-v3.Rmd`, respectively.
 
 ## Submodel Tutorials
 
-To provide deeper insight into some of the submodels' logic, we provide three R notebooks that can be used as tutorials. The R notebooks can be found at:
+To provide deeper insight into some of the submodels' logic, we provide four R notebooks that can be used as tutorials. The R notebooks can be found at:
 
 *`LHIEM/Fertility/Modeling Brirths.Rmd`
 
@@ -26,4 +26,6 @@ To provide deeper insight into some of the submodels' logic, we provide three R 
 
 *`LHIEM/Mortality/Predicting_Mortality_from_Health_Spending.Rmd`
 
-They can be viewed as HTML files or as interactive R markdown files.
+*`LHIEM/Medical Expenditures/10PlanExpenditures-v3.Rmd`
+
+These can be viewed as HTML files or as interactive R markdown files.

@@ -7,3 +7,11 @@ Propp, Adrienne, Vardavas, Raffaele, Price, Carter and Kapinos, Kandice (2025) '
 ## Description
 
 LHIEM was designed to assess a health care financing proposal that would allow individuals to borrow from the U.S. government to cover health care costs, requiring careful tracking of medical expenditures and medical debt over time. However, LHIEM is flexible enough to be used for a range of modeling needs related to predicting health care spending and income over time. The paper linked above describes the model and all dynamic modules in depth, and includes a case study to demonstrate how LHIEM can be used to evaluate proposed policy changes.
+
+## Module tutorials
+
+## Usage
+
+To run the model, navigate to LHIEM/Integration/10Plan_RunFile.R and run the program. The file `InputOutputFile.xlsx` contains the parameters used for the main experiments described in the paper. `10Plan_RunFile.R` loads this file, then executes `10Plan_Integrated_loanextracted.R` with the relevant specifications. The file `10Plan_Integrated_loanextracted.R` contains the main mechanics of the model, including the application of the proposed policy. The policy analysis is applied in a modular fashion (separate from the rest of the core model mechanics) to allow for easy modification of the policy analysis piece.
+
+The file `10Plan_RunFile_COVID.R` is a version of the model that was adapted to analyze the 10Plan policy under COVID conditions.
